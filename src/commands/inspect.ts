@@ -23,6 +23,18 @@ export async function inspectCommand(repoRoot: string, taskIdPartial: string): P
       `  baseline:    ${task.baseline.isGitRepo ? `${task.baseline.branch}@${task.baseline.headSha?.slice(0, 8)}${task.baseline.dirty ? ' (dirty)' : ''}` : 'not a git repo'}`,
     );
   }
+  if (task.pending) {
+    console.log('\n  pending:');
+    console.log(`    kind:      ${task.pending.kind}`);
+    if (task.pending.kind === 'plan_approval') {
+      console.log(`    plan:      ${task.pending.planPath}`);
+    } else {
+      console.log(`    question:  ${task.pending.question}`);
+    }
+    console.log(`    directive: ${task.pending.directive.action} (risk ${task.pending.directive.risk})`);
+    console.log(`    since:     ${task.pending.createdAt}`);
+    console.log(`    continue:  kairo resume ${task.id}  |  kairo ask ${task.id} "<answer>"`);
+  }
   console.log('\n  state history:');
   for (const entry of task.stateHistory) {
     console.log(`    ${entry.at}  ${entry.state}`);

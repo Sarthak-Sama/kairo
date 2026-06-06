@@ -83,10 +83,17 @@ kairo run "Add input validation to the signup form"
 
 kairo status                                 # list tasks and states
 kairo logs <task-id>                         # full agency event log
-kairo inspect <task-id>                      # task details + artifact tree
+kairo inspect <task-id>                      # task details, pending decision, artifact tree
 kairo check <task-id>                        # re-run configured checks
 kairo report <task-id>                       # print the final report
+
+# paused tasks (plan approval / codex question) are continuable:
+kairo resume <task-id>                       # interactive: shows the plan/question, prompts you
+kairo ask <task-id> "y"                      # non-interactive: approve a pending plan
+kairo ask <task-id> "Make it smaller"        # ...or send plan feedback / answer a question
 ```
+
+A paused task persists exactly what it is waiting for in `task.json` (`pending`). `kairo ask` answers one pending interaction per call — if the continuation pauses again (e.g. a revised plan needs approval), ask again. Messages sent via `ask` are recorded in `user-messages.ndjson`; a message to a task with nothing pending is recorded as a note and runs nothing.
 
 Task IDs accept unique fragments: `kairo logs signup` works if only one task matches.
 
@@ -97,6 +104,7 @@ Task IDs accept unique fragments: `kairo logs signup` works if only one task mat
 - `limits` — hard caps on phases, revision loops per phase, total model calls, and runtime minutes. The run stops as `blocked` when a limit is hit.
 - `checks` — shell commands run after each implementation phase (typecheck/lint/test/build by default). Checks whose binary or package script doesn't exist are recorded as **skipped**, never as failed.
 - `codex` / `claude` — command names, model, sandbox/permission mode.
+- `claude.transport` — `"print"` (default, proven `claude -p` subprocess) or `"pty"` (opt-in: same public print-mode command inside a real pseudo-terminal, with the transcript streamed to disk as it arrives). PTY is a transport foundation only — it is **not** persistent sessions, live message injection, or interactive permission-prompt control. It requires the optional `node-pty` dependency and fails with a clear message if that is missing.
 - `scanner.exclude` — globs excluded from the repo scan.
 
 ## Safety model
@@ -147,6 +155,6 @@ Task IDs accept unique fragments: `kairo logs signup` works if only one task mat
 
 See [docs/limitations.md](docs/limitations.md) for the honest list. Headlines:
 
-- **This is a v0 degraded session mode.** The product direction is persistent agency sessions; today each Codex call is a fresh `codex exec` with context reconstructed from artifacts, and Claude runs in non-interactive print mode (`claude -p`). True persistent Codex/Claude sessions are *not* implemented. The `node-pty` interactive Claude adapter and persistent session support are the next major upgrades.
-- `kairo resume` and `kairo ask` are not implemented yet; tasks paused on `awaiting_user_decision` or `awaiting_plan_approval` must currently be re-run.
-- `kairo run` requires a git repository with a clean working tree (by design — see Safety model).
+- **This is a v0 degraded session mode.** The product direction is persistent agency sessions; today each Codex call is a fresh `codex exec` with context reconstructed from artifacts, and Claude uses one-shot `claude -p` sessions through either the default print transport or the opt-in PTY transport. True persistent Codex/Claude sessions and live message injection are *not* implemented.
+- `kairo resume`/`kairo ask` continue tasks paused at checkpoints (plan approval, codex questions). They do **not** inject messages into an actively running model call — checkpoint resumability only.
+- `kairo run` requires a git repository with a clean working tree (by design — see Safety model). Resuming a task that already ran implementation phases is allowed with a dirty tree (Kairo's own changes), recorded as a risk in the report.

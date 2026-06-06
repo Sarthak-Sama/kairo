@@ -77,12 +77,13 @@ console.log('check ok');
   return dir;
 }
 
-function initKairo(sandbox, { claudeCommand = 'claude', codexCommand = 'codex' } = {}) {
+function initKairo(sandbox, { claudeCommand = 'claude', codexCommand = 'codex', claudeTransport = 'print' } = {}) {
   execSync(`node ${JSON.stringify(CLI)} init`, { cwd: sandbox });
   const configPath = join(sandbox, '.kairo', 'config.json');
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
   config.checks = [{ name: 'test', command: 'node check-test.js' }];
   config.claude.command = claudeCommand;
+  config.claude.transport = claudeTransport;
   config.codex.command = codexCommand;
   writeFileSync(configPath, JSON.stringify(config, null, 2));
 }
@@ -98,10 +99,15 @@ function makeEnv(scenario, stateDir, { stubsOnPath = true } = {}) {
   };
 }
 
-/** Non-interactive run: stdin is not a TTY, so approval/questions pause. */
-function runPlain(sandbox, env, task) {
+/**
+ * Non-interactive run: stdin is not a TTY, so approval/questions pause.
+ * Pass a string for `kairo run "<task>"` or an args array for any command
+ * (e.g. ['ask', taskId, 'y']).
+ */
+function runPlain(sandbox, env, taskOrArgs) {
+  const args = Array.isArray(taskOrArgs) ? taskOrArgs : ['run', taskOrArgs];
   return new Promise((resolveRun) => {
-    const child = spawn(process.execPath, [CLI, 'run', task], { cwd: sandbox, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [CLI, ...args], { cwd: sandbox, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.on('data', (d) => (out += d));
     child.stderr.on('data', (d) => (out += d));
@@ -138,6 +144,10 @@ function taskDir(sandbox) {
   const entries = existsSync(tasks) ? readdirSync(tasks) : [];
   if (entries.length !== 1) throw new Error(`expected exactly 1 task, found ${entries.length}`);
   return join(tasks, entries[0]);
+}
+
+function taskId(sandbox) {
+  return readdirSync(join(sandbox, '.kairo', 'tasks'))[0];
 }
 
 function readTask(sandbox) {
@@ -262,6 +272,25 @@ const SCENARIOS = {
     return { sandbox, stateDir };
   },
 
+  async pty_delegation(check) {
+    // Same happy delegation, but Claude runs through the opt-in PTY transport.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    // PTY spawn does not do PATH lookup through our injected env reliably —
+    // point the config at the stub binary by absolute path.
+    initKairo(sandbox, { claudeCommand: join(STUB_BIN, 'claude'), claudeTransport: 'pty' });
+    const { code } = await runPty(sandbox, makeEnv('happy_delegation', stateDir), 'Add a greeting feature', [
+      { when: 'approve plan?', send: 'y' },
+    ]);
+    check(code === 0, `exit code 0 (got ${code})`);
+    const task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.outcome === 'completed', `completed via pty transport (got ${task.outcome})`);
+    const transcript = readArtifact(sandbox, 'phase-001/claude-transcript.log');
+    check(transcript.includes('Working on phase 1'), 'streamed transcript captured stub output');
+    check(readArtifact(sandbox, 'phase-001/diff.patch').includes('feature.txt'), 'real edit captured');
+    return { sandbox, stateDir };
+  },
+
   async failed_check_revision(check) {
     const sandbox = makeSandbox();
     const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
@@ -322,6 +351,58 @@ const SCENARIOS = {
     check(readTask(sandbox).outcome === 'completed', 'completed');
     const decisions = readArtifact(sandbox, 'user-decisions.md');
     check(decisions.includes('Greeting in English or French?') && decisions.includes('English please'), 'Q&A recorded');
+    return { sandbox, stateDir };
+  },
+
+  async ask_resume_plan(check) {
+    // Pause at plan approval non-interactively, then continue via `kairo ask`.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox);
+    const env = makeEnv('plan_pause', stateDir);
+
+    const first = await runPlain(sandbox, env, 'Add a greeting feature');
+    check(first.code === 0, `run exits 0 while pausing (got ${first.code})`);
+    let task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.state === 'awaiting_plan_approval', 'paused awaiting_plan_approval');
+    check(task.pending?.kind === 'plan_approval', 'pending plan_approval persisted');
+
+    const second = await runPlain(sandbox, env, ['ask', taskId(sandbox), 'y']);
+    check(second.code === 0, `ask exits 0 (got ${second.code})`);
+    task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.state === 'reported' && task.outcome === 'completed', `completed after ask (got ${task.state}/${task.outcome})`);
+    check(task.pending === null, 'pending cleared');
+    check(has(sandbox, 'phase-001/claude-report.md'), 'claude implemented after approval');
+    check(existsSync(join(taskDir(sandbox), 'user-messages.ndjson')), 'user message recorded');
+    return { sandbox, stateDir };
+  },
+
+  async ask_resume_decision(check) {
+    // Pause at a codex question, answer via ask, approve the resulting plan via a second ask.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox);
+    const env = makeEnv('ask_user', stateDir);
+
+    const first = await runPlain(sandbox, env, 'Add a greeting feature');
+    check(first.code === 0, `run exits 0 while pausing (got ${first.code})`);
+    let task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.pending?.kind === 'user_decision', 'pending user_decision persisted');
+    check(task.pending?.question?.includes('English or French'), 'pending stores the question');
+
+    const second = await runPlain(sandbox, env, ['ask', taskId(sandbox), 'English please']);
+    check(second.code === 0, `first ask exits 0 (got ${second.code})`);
+    task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    // The post-decision delegation hits the plan gate; non-interactive ask pauses again.
+    check(task.state === 'awaiting_plan_approval', `re-paused at plan gate (got ${task.state})`);
+    check(task.pending?.kind === 'plan_approval', 'new pending plan_approval persisted');
+
+    const third = await runPlain(sandbox, env, ['ask', taskId(sandbox), 'approve']);
+    check(third.code === 0, `second ask exits 0 (got ${third.code})`);
+    task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.state === 'reported' && task.outcome === 'completed', `completed (got ${task.state}/${task.outcome})`);
+    const decisions = readArtifact(sandbox, 'user-decisions.md');
+    check(decisions.includes('English please'), 'answer recorded in user-decisions.md');
     return { sandbox, stateDir };
   },
 

@@ -58,6 +58,21 @@ describe('config', () => {
     expect(minimal.limits.maxRevisionLoopsPerPhase).toBe(3);
   });
 
+  it('defaults claude.transport to "print"', () => {
+    expect(ConfigSchema.parse({ version: 1 }).claude.transport).toBe('print');
+    expect(DEFAULT_CONFIG.claude.transport).toBe('print');
+  });
+
+  it('accepts explicit claude.transport "pty"', () => {
+    const parsed = ConfigSchema.parse({ version: 1, claude: { transport: 'pty' } });
+    expect(parsed.claude.transport).toBe('pty');
+  });
+
+  it('rejects unknown claude transports', () => {
+    const result = ConfigSchema.safeParse({ version: 1, claude: { transport: 'websocket' } });
+    expect(result.success).toBe(false);
+  });
+
   it('rejects checks with empty command', () => {
     const result = ConfigSchema.safeParse({
       version: 1,

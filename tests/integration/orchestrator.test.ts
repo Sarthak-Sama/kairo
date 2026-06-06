@@ -295,6 +295,12 @@ describe('orchestrator (mocked adapters)', () => {
     expect(actions).toContain('checks:run_checks:completed');
     expect(actions).toContain('codex:review:completed');
 
+    // Transcript streamed via onChunk lands exactly once — no duplication
+    // between chunk streaming and the buffered-fallback final write.
+    const transcript = await readText(join(phaseDir, 'claude-transcript.log'));
+    expect(transcript.match(/# Phase 1 Report/g)).toHaveLength(1);
+    expect(transcript).not.toContain('(empty transcript)');
+
     // Clean baseline is reflected in the report
     const report = await readText(outcome.reportPath!);
     expect(report).toContain('clean working tree');

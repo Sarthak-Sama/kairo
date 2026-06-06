@@ -9,9 +9,12 @@ and no model calls**; Level 3 talks to real models.
 pnpm test && pnpm typecheck && pnpm lint && pnpm build
 ```
 
-154 unit/integration tests with mocked adapters. Covers the orchestrator state
-machine, directive parsing, safety gate, checks, diffs, reports, and every
-control-flow path — but never crosses a process boundary.
+210 unit/integration tests. Most use mocked adapters; adapter/report tests also
+cover the Claude transport factory, PTY transport edge cases, terminal-output
+sanitization, checkpoint resume, and `kairo ask` audit honesty. This level
+covers the orchestrator state machine, directive parsing, safety gate, checks,
+diffs, reports, and every control-flow path — but never crosses a real model
+boundary.
 
 ## Level 1 — CLI smoke (no model CLIs)
 
@@ -30,7 +33,7 @@ node <kairo>/dist/cli.js status|logs|inspect|report|check <id>
 
 ```bash
 pnpm build
-pnpm e2e:stub                 # all 14 scenarios
+pnpm e2e:stub                 # all 17 scenarios
 pnpm e2e:stub happy_delegation self_edit    # subset
 KAIRO_E2E_KEEP=1 pnpm e2e:stub plan_pause   # keep sandboxes for inspection
 ```
@@ -47,10 +50,13 @@ node-pty; non-interactive scenarios prove the pause/refuse behavior.
 | `missing_codex` | friendly error naming `codex.command`, exit 1 |
 | `happy_delegation` | full artifact tree, real diff captured, checks run, report **safe to commit**, codex sandboxes read-only |
 | `self_edit` | separate write-enabled codex session (`workspace-write`), self-edit artifacts, approval gate bypassed, claude never touched |
+| `pty_delegation` | the same delegation through `claude.transport: "pty"` — stub claude runs inside a real PTY, transcript streamed to disk, real diff captured |
 | `failed_check_revision` | failed check → revision request → second claude run → completed |
 | `plan_feedback` | feedback → `plan-feedback` codex call → revised plan + revised instructions reach claude |
 | `plan_pause` | non-interactive delegation pauses as `awaiting_plan_approval` |
 | `ask_user` | question surfaces on the terminal, answer recorded in user-decisions.md |
+| `ask_resume_plan` | non-interactive pause persists `pending`; `kairo ask <id> y` continues to Claude and completion; pending cleared; message logged to user-messages.ndjson |
+| `ask_resume_decision` | paused question answered via `kairo ask`; post-decision delegation re-pauses at the plan gate; second `ask approve` completes the task |
 | `stop_blocked` / `stop_unsafe` | terminal states + **not safe to commit** |
 | `invalid_directive` | prose-only codex output → failed run, raw output saved |
 | `claude_missing` | delegation fails visibly with "required for delegated implementation" |
@@ -130,3 +136,18 @@ Findings fixed during live testing:
 3. Report verdicts aggregated transitional phase-1 failures forever → the
    commit recommendation now uses the latest result per check name; history
    stays in the event timeline.
+
+### Print + PTY transport validation
+
+After the resumability and PTY stages, live validation was repeated against the
+same real CLI versions:
+
+- print transport: PASS across a quick self-edit task and a forced delegated
+  multi-file CLI task;
+- PTY transport: first failed honestly because real `claude --print` refuses
+  prompt input from TTY stdin, then passed after Kairo changed PTY prompt
+  delivery to an argv element;
+- raw PTY transcripts preserve terminal artifacts, while the text used for
+  `claude-report.md` and Codex review is sanitized;
+- post-fix verification: `pnpm test` 210/210, `pnpm e2e:stub` 17/17,
+  typecheck/lint/build clean.

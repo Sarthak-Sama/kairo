@@ -7,19 +7,20 @@ This is the honest list for the current version (0.1.0).
 The intended product is a persistent agency: long-lived Codex and Claude sessions that retain their own working context across phases. **That is not what ships today.** The current implementation is a deliberate degraded mode:
 
 - every Codex call is a fresh, stateless `codex exec` invocation;
-- every Claude call is a fresh `claude -p` print-mode invocation;
+- every Claude call is a fresh `claude -p` one-shot invocation, through either the default print transport or the opt-in PTY transport;
 - continuity comes entirely from artifacts Kairo re-feeds into each prompt.
 
-This is honest and auditable, but it is not session persistence and should not be mistaken for it. The two next major upgrades are the `node-pty` interactive Claude adapter and real persistent session support for both CLIs.
+This is honest and auditable, but it is not session persistence and should not be mistaken for it. The next major product upgrade is run observability/control; real persistent session support for both CLIs remains a later-stage project.
 
-## Claude integration runs in print mode, not a PTY
+## Claude transports: print (default) and opt-in PTY
 
-The Claude adapter invokes `claude -p` (non-interactive print mode) via a plain subprocess. Consequences:
+The default transport invokes `claude -p` (non-interactive print mode) via a plain subprocess. The opt-in PTY transport (`claude.transport: "pty"`) runs the **same public print-mode command** inside a real pseudo-terminal and streams output to the transcript file as it arrives. Honest scope of both:
 
-- Claude's interactive permission prompts cannot be answered mid-run. The configured `permissionMode` (default `auto`, mapped to Claude's `acceptEdits`) decides up front what Claude may do. Operations outside that mode will be refused by Claude rather than prompted.
-- The transcript is captured at the end of the invocation, not streamed live.
-
-A `node-pty`-based interactive adapter is the planned upgrade. The adapter interface (`ClaudeAdapter`) is already in place so it can be swapped in without touching the orchestrator. `node-pty` is declared as an optional dependency for that reason.
+- **Permission prompts cannot be answered mid-run on either transport.** The configured `permissionMode` (default `auto` → Claude's `acceptEdits`) decides up front what Claude may do; operations outside that mode are refused by Claude, not prompted. The PTY transport does NOT change this — Kairo does not attempt to recognize or answer arbitrary permission prompts.
+- **No persistent Claude sessions and no live message injection** — on either transport. PTY is a transport foundation for those future stages, nothing more.
+- Print mode buffers output and writes the transcript at the end; PTY mode streams chunks to `claude-transcript.log` while running.
+- PTY caveats, accepted and documented (validated against Claude Code 2.1.167): `claude --print` refuses to read prompts from a TTY stdin, so the PTY transport passes the prompt as an argv element — prompts beyond ~180KB are rejected with guidance to use print mode (OS argv limits). Claude emits terminal mode-reset/ANSI sequences around its output; the raw transcript preserves them, while the text used for `claude-report.md` and review prompts is sanitized of escapes/control bytes.
+- If `node-pty` (optional dependency) is missing and transport is `"pty"`, the invocation fails with a clear message telling you to install it or switch back to `"print"`. There is no silent fallback by design.
 
 ## No CLI session resume; context is reconstructed from artifacts
 
@@ -30,9 +31,14 @@ Persistent session resume in the Codex and Claude CLIs is version-dependent and 
 
 Session metadata files (`codex-session.json`, `claude-session.json`) exist for inspection but are not used for resume.
 
-## `kairo resume` and `kairo ask` are not implemented
+## Resumability is checkpoint-based, not live
 
-A task that pauses as `awaiting_user_decision` in a non-interactive session cannot currently be continued in place. The question and full context are in the task folder (`user-decisions.md`, `agency-log.ndjson`); the workaround is to start a new run with the decision included in the task description. The state model and artifact layout were designed so resume can be added without migration.
+`kairo resume` and `kairo ask` continue tasks paused at `awaiting_plan_approval` or `awaiting_user_decision`. What they are NOT:
+
+- **No live message injection.** You cannot send direction to a Codex or Claude call that is actively running; messages only apply at persisted checkpoints.
+- **No model-session resume.** Continuation context is reconstructed from artifacts (master plan, phase folders, diffs, check results) — see the degraded-session section above. Phase reconstruction tolerates missing artifacts with visible placeholders.
+- Tasks paused **before** resumability existed have no `pending` metadata in task.json and cannot be resumed; start a new run.
+- A crashed run (state `implementing`, `reviewing`, …) is not a checkpoint and is not resumable; only deliberate pauses are.
 
 ## Git repo with a clean working tree is mandatory
 

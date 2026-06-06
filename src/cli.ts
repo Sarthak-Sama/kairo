@@ -7,6 +7,8 @@ import { logsCommand } from './commands/logs.js';
 import { inspectCommand } from './commands/inspect.js';
 import { checkCommand } from './commands/check.js';
 import { reportCommand } from './commands/report.js';
+import { resumeCommand } from './commands/resume.js';
+import { askCommand } from './commands/ask.js';
 import { ConfigError } from './core/config.js';
 
 const program = new Command();
@@ -43,6 +45,19 @@ program
   .argument('<task>', 'task description')
   .description('Run a task through the Codex/Claude agency loop')
   .action((task: string) => wrap(() => runCommand(repoRoot, task))());
+
+program
+  .command('resume')
+  .argument('<task-id>', 'task id (or unique fragment)')
+  .description('Resume a paused task (awaiting plan approval or user decision)')
+  .action((taskId: string) => wrap(() => resumeCommand(repoRoot, taskId))());
+
+program
+  .command('ask')
+  .argument('<task-id>', 'task id (or unique fragment)')
+  .argument('<message>', 'answer/feedback for the pending decision')
+  .description('Answer a paused task non-interactively (approval, feedback, or decision)')
+  .action((taskId: string, message: string) => wrap(() => askCommand(repoRoot, taskId, message))());
 
 program
   .command('status')

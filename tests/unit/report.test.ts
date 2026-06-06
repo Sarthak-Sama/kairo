@@ -16,6 +16,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     revisionCount: 0,
     modelCalls: 3,
     outcome: 'completed',
+    pending: null,
     stateHistory: [],
     ...overrides,
   };

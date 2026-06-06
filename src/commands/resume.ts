@@ -7,16 +7,14 @@ import { createClaudeAdapter } from '../adapters/claude-factory.js';
 import { TimelineRenderer } from '../renderers/timeline.js';
 import { makeApprovePlan, makeAskUser } from './interactive.js';
 
-export async function runCommand(repoRoot: string, taskTitle: string): Promise<void> {
-  const config = await loadConfig(repoRoot); // throws with "run kairo init" guidance if missing
+/** Resume a paused task interactively from its persisted pending checkpoint. */
+export async function resumeCommand(repoRoot: string, taskIdPartial: string): Promise<void> {
+  const config = await loadConfig(repoRoot);
   const runner = new ExecaProcessRunner();
   const codex = new CodexCliAdapter(runner, config, repoRoot);
   const claude = createClaudeAdapter(runner, config, repoRoot);
   const timeline = new TimelineRenderer();
 
-  // Codex is required up front — every run starts with Codex triage. Claude
-  // is only required if the run actually delegates implementation, so its
-  // availability is checked by the orchestrator at delegation time.
   if (!(await codex.isAvailable())) {
     console.error(
       `[kairo] Codex CLI ("${config.codex.command}") not found on PATH. Install it or set codex.command in .kairo/config.json.`,
@@ -25,21 +23,22 @@ export async function runCommand(repoRoot: string, taskTitle: string): Promise<v
     return;
   }
 
-  const askUser = makeAskUser();
-  const approvePlan = makeApprovePlan();
-
   const orchestrator = new Orchestrator({
     config,
     repoRoot,
     codex,
     claude,
     runner,
-    askUser,
-    approvePlan,
+    askUser: makeAskUser(),
+    approvePlan: makeApprovePlan(),
     onEvent: (event) => timeline.render(event),
   });
 
-  const outcome = await orchestrator.run(taskTitle);
+  const outcome = await orchestrator.resume(taskIdPartial);
+  if (outcome.outcome === 'still_paused') {
+    timeline.info(`task ${outcome.taskId} remains paused (${outcome.finalState}) — no answer provided`);
+    return;
+  }
   if (outcome.reportPath) {
     timeline.info(`report saved: ${outcome.reportPath}`);
   }

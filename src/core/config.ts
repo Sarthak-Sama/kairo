@@ -30,6 +30,8 @@ export const ConfigSchema = z.object({
       command: z.string().default('claude'),
       model: z.string().default('sonnet'),
       permissionMode: z.string().default('auto'),
+      /** "print" = proven `claude -p` subprocess (default); "pty" = opt-in PTY transport. */
+      transport: z.enum(['print', 'pty']).default('print'),
     })
     .default({}),
   checks: z.array(CheckSchema).default([]),
@@ -61,6 +63,7 @@ export const DEFAULT_CONFIG: KairoConfig = {
     command: 'claude',
     model: 'sonnet',
     permissionMode: 'auto',
+    transport: 'print',
   },
   checks: [
     { name: 'typecheck', command: 'pnpm typecheck' },

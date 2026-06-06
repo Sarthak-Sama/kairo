@@ -19,7 +19,11 @@ if (!stateDir) {
   process.exit(2);
 }
 
-const prompt = fs.readFileSync(0, 'utf8');
+// Print transport pipes the prompt on stdin; PTY transport passes it as the
+// argv element after -p (real `claude --print` refuses TTY stdin).
+const argvAfterP = process.argv[2] === '-p' ? process.argv[3] : undefined;
+const prompt =
+  argvAfterP !== undefined && !argvAfterP.startsWith('-') ? argvAfterP : fs.readFileSync(0, 'utf8');
 const phaseMatch = prompt.match(/## Phase (\d+) instructions/);
 const phase = phaseMatch ? Number(phaseMatch[1]) : 1;
 const isRevision = prompt.includes('This is a REVISION request');

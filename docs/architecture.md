@@ -16,7 +16,8 @@ Kairo never makes technical judgments itself. It executes a protocol: it validat
 src/cli.ts                 commander entry point
 src/commands/*             one file per CLI command, thin over core
 src/core/
-  orchestrator.ts          the agency loop (the only place control flow lives)
+  orchestrator.ts          the agency loop + resume (the only place control flow lives)
+  phase-reconstruction.ts  rebuild phase records from artifacts for resumed runs
   config.ts                zod-validated .kairo/config.json
   task-store.ts            file-backed task state + state history
   events.ts                append-only NDJSON audit log
@@ -30,7 +31,9 @@ src/core/
 src/adapters/
   process-runner.ts        single choke-point for all shell execution
   codex.ts                 codex exec wrapper -> directives
-  claude.ts                claude -p wrapper -> transcripts
+  claude.ts                claude -p subprocess transport (default)
+  claude-pty.ts            opt-in PTY transport (streams chunks)
+  claude-factory.ts        selects the transport from config
 src/renderers/timeline.ts  live one-line-per-event timeline
 ```
 
@@ -83,6 +86,10 @@ Claude's write access is governed by Claude Code's own permission mode.
 ## The artifact ledger
 
 The design rule is: **every meaningful decision leaves a file.** State transitions are persisted to `task.json` before the next step runs; events are appended to `agency-log.ndjson` as they happen. A crash mid-run therefore leaves a coherent, inspectable trail rather than a mystery.
+
+## Checkpoint resumability
+
+When a run pauses (plan approval, codex question), `task.json` records exactly what is pending — the directive, the question or plan path, and a timestamp — under `pending`. This is canonical state: `kairo resume` (interactive) and `kairo ask` (one message per call) continue from it without re-parsing the audit log. On resume the orchestrator rebuilds prior phase context from the phase artifact folders (`src/core/phase-reconstruction.ts`), re-enters the same agency loop (`runLoop`), and clears `pending` once the interaction is handled. The fresh-run clean-tree gate relaxes on resume only when implementation phases already ran — Kairo's own prior changes are expected then and recorded as a report risk. Live message injection into a running model call is explicitly out of scope.
 
 This is also the session strategy — and it is a deliberate **v0 degraded mode**, not the end state. The product direction is persistent agency sessions; today, instead of depending on Codex/Claude CLI session resume (which varies across CLI versions), every Codex call is a fresh stateless invocation given reconstructed context from artifacts: the repo scan, the master plan, the implementer's report, the diff, and check results. Session metadata is still recorded (`codex-session.json`, `claude-session.json`) for inspection. Persistent sessions and the node-pty Claude adapter are the next major upgrades (see docs/limitations.md).
 

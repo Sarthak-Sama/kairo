@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { join } from 'node:path';
 import { readdir } from 'node:fs/promises';
 import { ensureDir, fileExists, readJson, writeJson } from '../utils/fs.js';
+import { DirectiveSchema } from './directives.js';
 
 export const TASK_STATES = [
   'created',
@@ -30,6 +31,29 @@ const TERMINAL_STATES: ReadonlySet<TaskState> = new Set([
   'reported',
 ]);
 
+/**
+ * Canonical record of what a paused task is waiting for. task.json is the
+ * source of truth for resume — the NDJSON log is audit trail only.
+ */
+export const PendingSchema = z
+  .discriminatedUnion('kind', [
+    z.object({
+      kind: z.literal('plan_approval'),
+      directive: DirectiveSchema,
+      planPath: z.string(),
+      createdAt: z.string(),
+    }),
+    z.object({
+      kind: z.literal('user_decision'),
+      directive: DirectiveSchema,
+      question: z.string(),
+      createdAt: z.string(),
+    }),
+  ])
+  .nullable();
+
+export type PendingState = z.infer<typeof PendingSchema>;
+
 export const TaskSchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1),
@@ -50,6 +74,8 @@ export const TaskSchema = z.object({
   revisionCount: z.number().int().min(0).default(0),
   modelCalls: z.number().int().min(0).default(0),
   outcome: z.string().nullable().default(null),
+  // Tasks created before resumability load with pending: null.
+  pending: PendingSchema.default(null),
   stateHistory: z
     .array(
       z.object({
@@ -110,6 +136,7 @@ export class TaskStore {
       revisionCount: 0,
       modelCalls: 0,
       outcome: null,
+      pending: null,
       stateHistory: [{ state: 'created', at: now }],
     };
     await ensureDir(this.taskDir(input.id));

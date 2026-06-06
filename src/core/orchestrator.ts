@@ -3,7 +3,8 @@ import type { KairoConfig } from './config.js';
 import type { CodexAdapter } from '../adapters/codex.js';
 import type { ClaudeAdapter } from '../adapters/claude.js';
 import type { ProcessRunner } from '../adapters/process-runner.js';
-import { TaskStore, type Task } from './task-store.js';
+import { TaskStore, isTerminalState, type Task, type PendingState } from './task-store.js';
+import { reconstructPhases, type PhaseRecord } from './phase-reconstruction.js';
 import { EventLogger, readEventLog } from './events.js';
 import { scanRepo } from './repo-scanner.js';
 import { captureBaseline, captureDiff } from './diff.js';
@@ -39,18 +40,20 @@ export interface RunOutcome {
   reportPath: string | null;
 }
 
-interface PhaseRecord {
+interface LoopContext {
+  task: Task;
+  taskDir: string;
+  events: EventLogger;
+  masterPlan: string;
+  directive: Directive;
+  phases: PhaseRecord[];
   phase: number;
-  claudeReport: string;
-  checksRun: ChecksRun | null;
-  changedFiles: string[];
-  review: string;
-  /** Risk level Codex declared on the directive that drove this phase. */
-  directiveRisk: 'low' | 'medium' | 'high';
-  /** Risk level Codex declared on its review directive (null until reviewed). */
-  reviewRisk: 'low' | 'medium' | 'high' | null;
-  diffAvailable: boolean;
-  diffNote?: string;
+  revisionCount: number;
+  planApproved: boolean;
+}
+
+export function isApproval(answer: string): boolean {
+  return /^(y|yes|approve)$/i.test(answer.trim());
 }
 
 /**
@@ -88,6 +91,8 @@ export class Orchestrator {
   private readonly clock: () => Date;
   private modelCalls = 0;
   private startedAt = 0;
+  /** Extra risks accumulated by resume conditions; merged into every report. */
+  private resumeRisks: string[] = [];
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.clock = deps.clock ?? (() => new Date());
@@ -128,6 +133,128 @@ export class Orchestrator {
       const reportPath = await this.writeReport(taskId, taskDir, [], `Run crashed: ${(err as Error).message}`);
       return { taskId, finalState: 'failed', outcome: 'failed', reportPath };
     }
+  }
+
+  /**
+   * Resume a paused task from its persisted pending checkpoint.
+   *
+   * @param input  undefined → interactive (prompt via deps.approvePlan/askUser);
+   *               a string  → non-interactive answer from `kairo ask`.
+   */
+  async resume(taskIdPartial: string, input?: string): Promise<RunOutcome> {
+    this.startedAt = Date.now();
+    const taskId = await this.store.resolveTaskId(taskIdPartial);
+    const task = await this.store.getTask(taskId);
+    const taskDir = this.store.taskDir(taskId);
+
+    if (isTerminalState(task.state)) {
+      throw new Error(`task ${taskId} is ${task.state} — terminal tasks cannot be resumed`);
+    }
+    if (task.state !== 'awaiting_plan_approval' && task.state !== 'awaiting_user_decision') {
+      throw new Error(
+        `task ${taskId} is not paused (state: ${task.state}) — only awaiting_plan_approval and awaiting_user_decision can be resumed`,
+      );
+    }
+    const pending = task.pending;
+    if (!pending) {
+      throw new Error(
+        `task ${taskId} is paused but has no pending metadata (created before resumability?) — start a new run instead`,
+      );
+    }
+
+    this.modelCalls = task.modelCalls;
+    const events = new EventLogger(join(taskDir, 'agency-log.ndjson'), this.clock);
+    if (this.deps.onEvent) events.onEvent(this.deps.onEvent);
+
+    // Rebuild prior phase context from artifacts (task.json + phase folders
+    // are canonical; the NDJSON log stays audit-only).
+    const phases = await reconstructPhases(taskDir);
+
+    // Dirty-tree rules on resume: before any implementation the tree must
+    // still be clean; after implementation, Kairo's own prior changes are
+    // expected — allow, but record the risk. Never stash/clean/commit.
+    const status = await this.deps.runner.runShell('git status --porcelain', {
+      cwd: this.deps.repoRoot,
+      skipSafetyCheck: true,
+    });
+    const dirty = status.exitCode === 0 && status.stdout.trim().length > 0;
+    if (dirty && phases.length === 0) {
+      await events.log({
+        actor: 'kairo',
+        action: 'resume',
+        status: 'failed',
+        message: 'resume refused: working tree has changes but no implementation phase has run — commit or stash, then resume again',
+      });
+      throw new Error(
+        'working tree has uncommitted changes and no implementation phase has run yet — commit or stash them, then resume again',
+      );
+    }
+    if (dirty && phases.length > 0) {
+      this.resumeRisks.push('medium: resumed with existing working-tree changes from prior task phases');
+      await events.log({
+        actor: 'kairo',
+        action: 'resume',
+        status: 'completed',
+        message: 'resuming with existing working-tree changes from prior phases (recorded as medium risk)',
+      });
+    }
+
+    await events.log({
+      actor: 'kairo',
+      action: 'resume',
+      status: 'started',
+      message: `resuming from ${pending.kind} (${input !== undefined ? 'kairo ask' : 'kairo resume'})`,
+    });
+
+    const masterPlan = await this.loadMasterPlan(taskDir);
+    const phase = Math.max(1, task.currentPhase, ...phases.map((p) => p.phase));
+    // Gate state is derived, not persisted: an explicit approval leaves a
+    // planning_approved transition; any completed phase implies the gate
+    // passed or was legitimately bypassed.
+    const planApproved =
+      task.stateHistory.some((h) => h.state === 'planning_approved') || phases.length > 0;
+
+    if (pending.kind === 'plan_approval') {
+      const answer = input !== undefined ? input : await this.deps.approvePlan(pending.planPath);
+      if (answer === null || answer.trim() === '') {
+        await events.log({ actor: 'kairo', action: 'resume', status: 'skipped', message: 'no answer provided — task remains paused' });
+        return { taskId, finalState: task.state, outcome: 'still_paused', reportPath: null };
+      }
+      if (isApproval(answer)) {
+        await this.recordDecision(taskDir, `**Plan approval (resume)** for action \`${pending.directive.action}\``, 'approved');
+        await this.setPending(taskId, null);
+        await this.store.transition(taskId, 'planning_approved');
+        await events.log({ actor: 'user', action: 'plan_approval', status: 'completed', message: 'plan approved by user (resume)' });
+        return this.runLoop({ task, taskDir, events, masterPlan, directive: pending.directive, phases, phase, revisionCount: 0, planApproved: true });
+      }
+      // Feedback: revise the plan via Codex, then continue (the approval gate
+      // re-applies to the revised directive inside the loop).
+      await this.recordDecision(taskDir, `**Plan approval (resume)** for action \`${pending.directive.action}\``, `Feedback: ${answer}`);
+      await this.setPending(taskId, null);
+      await events.log({ actor: 'user', action: 'plan_feedback', status: 'completed', message: 'user sent plan feedback to codex (resume)' });
+      const revision = await this.requestPlanRevision(taskDir, events, task, masterPlan, answer);
+      if ('error' in revision) {
+        return this.finishFailed(taskId, taskDir, events, phases, revision.error);
+      }
+      let plan = masterPlan;
+      if (revision.revisedPlan) {
+        plan = revision.revisedPlan;
+        await writeText(join(taskDir, 'master-plan.md'), plan);
+      }
+      return this.runLoop({ task, taskDir, events, masterPlan: plan, directive: revision.revisedDirective, phases, phase, revisionCount: 0, planApproved: false });
+    }
+
+    // pending.kind === 'user_decision'
+    const answer = input !== undefined ? input : await this.deps.askUser(pending.question);
+    if (answer === null || answer.trim() === '') {
+      await events.log({ actor: 'kairo', action: 'resume', status: 'skipped', message: 'no answer provided — task remains paused' });
+      return { taskId, finalState: task.state, outcome: 'still_paused', reportPath: null };
+    }
+    await this.recordDecision(taskDir, `**Q (codex, resume):** ${pending.question}`, answer);
+    await this.setPending(taskId, null);
+    await events.log({ actor: 'user', action: 'decision', status: 'completed', message: 'user answered (resume)' });
+    const directive = await this.reinvokeCodexAfterUser(taskId, taskDir, events, task, masterPlan, pending.directive, answer, phases);
+    return this.runLoop({ task, taskDir, events, masterPlan, directive, phases, phase, revisionCount: 0, planApproved });
   }
 
   private async runInner(task: Task, taskDir: string, events: EventLogger): Promise<RunOutcome> {
@@ -211,9 +338,9 @@ export class Orchestrator {
     }
 
     // Master plan = the prose Codex wrote before the directive JSON.
-    let masterPlan = extractProse(triage.result.lastMessage);
+    const masterPlan = extractProse(triage.result.lastMessage);
     await writeText(join(taskDir, 'master-plan.md'), masterPlan || '(Codex provided no plan prose)');
-    let directive = triage.parsed.directive;
+    const directive = triage.parsed.directive;
     await events.log({
       actor: 'codex',
       action: 'classify_task',
@@ -223,13 +350,27 @@ export class Orchestrator {
     });
     await events.log({ actor: 'codex', action: 'plan_ready', status: 'completed', message: 'plan ready' });
 
-    const phases: PhaseRecord[] = [];
-    let phase = 1;
-    let revisionCount = 0;
-    // The plan approval gate applies to the first implementation-bearing
-    // directive of the run; once approved (or bypassed for quick low-risk
-    // self-edits) later review-loop directives do not re-prompt.
-    let planApproved = false;
+    return this.runLoop({
+      task,
+      taskDir,
+      events,
+      masterPlan,
+      directive,
+      phases: [],
+      phase: 1,
+      revisionCount: 0,
+      planApproved: false,
+    });
+  }
+
+  /**
+   * The agency loop, shared by fresh runs and resumed runs. Each iteration
+   * acts on the current directive until a terminal or paused outcome.
+   */
+  private async runLoop(ctx: LoopContext): Promise<RunOutcome> {
+    const { task, taskDir, events, phases } = ctx;
+    const taskId = task.id;
+    let { masterPlan, directive, phase, revisionCount, planApproved } = ctx;
     // Backstop iteration guard: the limits below (phases, revisions, model
     // calls) should always bound the loop first; this catches directive cycles
     // that would otherwise evade all of them.
@@ -237,7 +378,6 @@ export class Orchestrator {
       this.deps.config.limits.maxPhases * (this.deps.config.limits.maxRevisionLoopsPerPhase + 2) + 10;
     let iterations = 0;
 
-    // Main agency loop. Each iteration acts on the current directive.
     for (;;) {
       if (++iterations > maxIterations) {
         return this.finishBlocked(taskId, taskDir, events, phases, `loop iteration guard tripped (${maxIterations} iterations)`);
@@ -248,10 +388,22 @@ export class Orchestrator {
 
       switch (directive.action) {
         case 'ask_user': {
-          const answer = await this.handleAskUser(taskId, taskDir, events, directive);
-          if (answer === null) {
-            return this.finishState(taskId, taskDir, events, phases, 'awaiting_user_decision', 'awaiting user decision (no interactive channel)');
+          const question = directive.question ?? directive.reason;
+          await this.store.transition(taskId, 'awaiting_user_decision');
+          await events.log({ actor: 'codex', action: 'ask_user', status: 'started', message: `needs user decision: ${question}` });
+          const answer = await this.deps.askUser(question);
+          if (answer === null || answer.trim() === '') {
+            await this.recordDecision(taskDir, `**Q (codex):** ${question}`, '(no answer — run paused; continue with `kairo resume` or `kairo ask`)');
+            await this.setPending(taskId, {
+              kind: 'user_decision',
+              directive,
+              question,
+              createdAt: this.clock().toISOString(),
+            });
+            return this.finishState(taskId, taskDir, events, phases, 'awaiting_user_decision', 'awaiting user decision — continue with `kairo resume` or `kairo ask`');
           }
+          await this.recordDecision(taskDir, `**Q (codex):** ${question}`, answer);
+          await events.log({ actor: 'user', action: 'decision', status: 'completed', message: 'user answered' });
           // Feed the answer back to Codex for a fresh directive.
           directive = await this.reinvokeCodexAfterUser(taskId, taskDir, events, task, masterPlan, directive, answer, phases);
           continue;
@@ -403,42 +555,59 @@ export class Orchestrator {
     });
 
     const answer = await this.deps.approvePlan(planPath);
-    const stamp = this.clock().toISOString();
 
-    if (answer === null) {
-      await appendText(
-        join(taskDir, 'user-decisions.md'),
-        `## ${stamp}\n\n**Plan approval requested** for action \`${directive.action}\` — no answer (non-interactive or empty response). Run paused.\n\n`,
+    if (answer === null || answer.trim() === '') {
+      await this.recordDecision(
+        taskDir,
+        `**Plan approval requested** for action \`${directive.action}\``,
+        '(no answer — run paused; continue with `kairo resume` or `kairo ask`)',
       );
+      await this.setPending(taskId, {
+        kind: 'plan_approval',
+        directive,
+        planPath,
+        createdAt: this.clock().toISOString(),
+      });
       return this.finishState(
         taskId,
         taskDir,
         events,
         phases,
         'awaiting_plan_approval',
-        `awaiting plan approval — review ${planPath} and re-run with your decision`,
+        `awaiting plan approval — review ${planPath}, then \`kairo resume\` or \`kairo ask\``,
       );
     }
 
-    if (/^(y|yes|approve)$/i.test(answer.trim())) {
-      await appendText(
-        join(taskDir, 'user-decisions.md'),
-        `## ${stamp}\n\n**Plan approval requested** for action \`${directive.action}\`.\n\n**A (user):** approved\n\n`,
-      );
+    if (isApproval(answer)) {
+      await this.recordDecision(taskDir, `**Plan approval requested** for action \`${directive.action}\``, 'approved');
+      await this.setPending(taskId, null);
       await this.store.transition(taskId, 'planning_approved');
       await events.log({ actor: 'user', action: 'plan_approval', status: 'completed', message: 'plan approved by user' });
       return {};
     }
 
     // Anything else is plan feedback: send it back to Codex for a revised directive.
-    await appendText(
-      join(taskDir, 'user-decisions.md'),
-      `## ${stamp}\n\n**Plan approval requested** for action \`${directive.action}\`.\n\n**Feedback (user):** ${answer}\n\n`,
-    );
+    await this.recordDecision(taskDir, `**Plan approval requested** for action \`${directive.action}\``, `Feedback: ${answer}`);
+    await this.setPending(taskId, null);
     await events.log({ actor: 'user', action: 'plan_feedback', status: 'completed', message: 'user sent plan feedback to codex' });
     if (!(await this.checkLimits(taskId, events))) {
       return this.finishBlocked(taskId, taskDir, events, phases, 'limits reached while revising plan');
     }
+    const revision = await this.requestPlanRevision(taskDir, events, task, masterPlan, answer);
+    if ('error' in revision) {
+      return this.finishFailed(taskId, taskDir, events, phases, revision.error);
+    }
+    return revision;
+  }
+
+  /** Send plan feedback to Codex (read-only) and parse the revised directive. */
+  private async requestPlanRevision(
+    taskDir: string,
+    events: EventLogger,
+    task: Task,
+    masterPlan: string,
+    feedback: string,
+  ): Promise<{ revisedDirective: Directive; revisedPlan?: string } | { error: string }> {
     this.modelCalls++;
     const revised = await this.deps.codex.invokeForDirective({
       purpose: 'plan-feedback',
@@ -452,7 +621,7 @@ ${task.title}
 ${masterPlan}
 
 ## User feedback on the plan
-${answer}
+${feedback}
 
 Reply with your revised reasoning and end with one directive JSON object in a \`\`\`json fence (same schema as before).`,
     });
@@ -464,7 +633,7 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
         status: 'failed',
         message: 'Codex returned an invalid directive after plan feedback; raw output saved — inspect the task folder.',
       });
-      return this.finishFailed(taskId, taskDir, events, phases, 'Codex produced an invalid directive after plan feedback');
+      return { error: 'Codex produced an invalid directive after plan feedback' };
     }
     await events.log({
       actor: 'codex',
@@ -654,17 +823,47 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
         message: isRevision ? `revising phase ${phase}` : `implementing phase ${phase}`,
       });
 
-      // NOTE: the current Claude adapter buffers output and delivers it once
-      // at process exit (see docs/limitations.md); the transcript is written
-      // after the invocation, not streamed. The onChunk hook exists for the
-      // future PTY adapter.
+      // Stream the transcript to disk as chunks arrive (the PTY transport
+      // streams continuously; the print transport delivers one chunk at exit).
+      // Appends are serialized through a promise chain so chunks land in
+      // order, and the final write only happens when nothing was streamed —
+      // never both, so content is not duplicated.
       const transcriptPath = join(phaseDir, 'claude-transcript.log');
+      await writeText(transcriptPath, '');
+      let streamedBytes = 0;
+      const stream = { writeError: null as Error | null };
+      let writeChain: Promise<void> = Promise.resolve();
       const result = await this.deps.claude.invoke({
         purpose: `phase-${phase}${isRevision ? '-revision' : ''}`,
         prompt,
+        onChunk: (chunk) => {
+          streamedBytes += chunk.length;
+          // Each link handles its own rejection so the chain can never become
+          // an unhandled rejection; the first failure is remembered and the
+          // complete transcript is rewritten from the result below.
+          writeChain = writeChain
+            .then(() => appendText(transcriptPath, chunk))
+            .catch((err) => {
+              stream.writeError ??= err as Error;
+            });
+        },
       });
       this.modelCalls++;
-      await writeText(transcriptPath, result.transcript || '(empty transcript)');
+      await writeChain; // flush in-flight appends before finalizing
+      if (streamedBytes === 0 || stream.writeError) {
+        // Nothing streamed (buffering adapter) or streaming hit a write error:
+        // finalize from the adapter's complete transcript so the artifact is
+        // whole either way — never both, so content is not duplicated.
+        await writeText(transcriptPath, result.transcript || '(empty transcript)');
+      }
+      if (stream.writeError) {
+        await events.log({
+          actor: 'kairo',
+          action: 'transcript_stream',
+          status: 'failed',
+          message: `streaming the Claude transcript failed (${stream.writeError.message}); the complete transcript was written after completion instead`,
+        });
+      }
       await writeText(join(taskDir, 'claude-session.json'), JSON.stringify({
         lastInvocation: { purpose: `phase-${phase}`, exitCode: result.exitCode, durationMs: result.durationMs },
       }, null, 2));
@@ -762,22 +961,24 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
     return checksRun;
   }
 
-  private async handleAskUser(
-    taskId: string,
-    taskDir: string,
-    events: EventLogger,
-    directive: Directive,
-  ): Promise<string | null> {
-    const question = directive.question ?? directive.reason;
-    await this.store.transition(taskId, 'awaiting_user_decision');
-    await events.log({ actor: 'codex', action: 'ask_user', status: 'started', message: `needs user decision: ${question}` });
-    const answer = await this.deps.askUser(question);
-    const decisionLine = `## ${this.clock().toISOString()}\n\n**Q (codex):** ${question}\n\n**A (user):** ${answer ?? '(no answer — run was non-interactive)'}\n\n`;
-    await appendText(join(taskDir, 'user-decisions.md'), decisionLine);
-    if (answer !== null) {
-      await events.log({ actor: 'user', action: 'decision', status: 'completed', message: 'user answered' });
-    }
-    return answer;
+  /** Append a question/answer pair (or note) to user-decisions.md. */
+  private async recordDecision(taskDir: string, heading: string, answer: string): Promise<void> {
+    await appendText(
+      join(taskDir, 'user-decisions.md'),
+      `## ${this.clock().toISOString()}\n\n${heading}\n\n**A (user):** ${answer}\n\n`,
+    );
+  }
+
+  /** Persist (or clear) the canonical pending-interaction metadata on task.json. */
+  private async setPending(taskId: string, pending: PendingState): Promise<void> {
+    const task = await this.store.getTask(taskId);
+    task.pending = pending;
+    await this.store.saveTask(task);
+  }
+
+  private async loadMasterPlan(taskDir: string): Promise<string> {
+    const path = join(taskDir, 'master-plan.md');
+    return (await fileExists(path)) ? await readText(path) : '(master plan artifact missing)';
   }
 
   private async reinvokeCodexAfterUser(
@@ -940,7 +1141,7 @@ Continue the task with this answer. Reply with your reasoning and end with one d
 
     // Assemble real risk evidence. "high:"/"medium:" prefixes drive the
     // commit recommendation in generateReport.
-    const risks: string[] = [...extraRisks];
+    const risks: string[] = [...extraRisks, ...this.resumeRisks];
     for (const p of phases) {
       if (p.directiveRisk === 'high') {
         risks.push(`high: phase ${p.phase} directive was flagged high risk by Codex`);
@@ -1005,10 +1206,38 @@ function extractProse(message: string): string {
   return message.slice(0, fenceIndex).trim();
 }
 
-/** Pull the structured report section out of Claude's transcript; fall back to the tail. */
-function extractClaudeReport(transcript: string): string {
-  const match = transcript.match(/# Phase \d+ Report[\s\S]*$/);
-  if (match) return match[0].trim();
+/**
+ * Strip terminal artifacts (ANSI/OSC escape sequences, carriage returns,
+ * stray control bytes) from PTY-captured text. Used ONLY for the text that
+ * feeds claude-report.md and review prompts — the raw transcript artifact is
+ * preserved exactly as captured.
+ */
+export function stripTerminalArtifacts(text: string): string {
+  return (
+    text
+      // OSC sequences: ESC ] ... (BEL | ESC \)
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
+      // CSI and other ESC-led sequences: ESC [ ... final byte, ESC ( X, ESC 7/8, etc.
+      .replace(/\x1b(?:\[[0-9;<>=?]*[a-zA-Z@^_`{|}~]|\([A-Za-z0-9]|[78=>]|.)?/g, '')
+      .replace(/\r\n?/g, '\n')
+      // remaining C0 control bytes except \n and \t
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+  );
+}
+
+/**
+ * Pull the structured report section out of Claude's transcript; fall back to
+ * the tail. Input is sanitized of terminal artifacts first (PTY transport),
+ * and the LAST report-header occurrence wins — earlier occurrences can be the
+ * report template quoted/echoed in context rather than the actual report.
+ */
+export function extractClaudeReport(rawTranscript: string): string {
+  const transcript = stripTerminalArtifacts(rawTranscript);
+  const headers = [...transcript.matchAll(/# Phase \d+ Report/g)];
+  const last = headers[headers.length - 1];
+  if (last && last.index !== undefined) {
+    return transcript.slice(last.index).trim();
+  }
   const tail = transcript.trim().slice(-3000);
   return tail.length > 0 ? `(no structured report found — transcript tail)\n\n${tail}` : '(empty transcript)';
 }

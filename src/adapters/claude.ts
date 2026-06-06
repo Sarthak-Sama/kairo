@@ -25,13 +25,13 @@ export interface ClaudeAdapter {
 /**
  * Claude Code CLI adapter — subprocess implementation.
  *
- * KNOWN LIMITATION (documented in docs/limitations.md): this first pass runs
- * Claude in non-interactive print mode (`claude -p`) via a plain subprocess.
- * Interactive permission prompts cannot be answered in this mode, so the
- * permission mode from config is passed through and Claude's own permission
- * system decides what to allow. A node-pty path (ClaudePtyAdapter) is the
- * planned upgrade for fully interactive TTY behavior; the interface here is
- * adapter-shaped so it can be swapped in without touching the orchestrator.
+ * KNOWN LIMITATION (documented in docs/limitations.md): this default transport
+ * runs Claude in non-interactive print mode (`claude -p`) via a plain
+ * subprocess. Interactive permission prompts cannot be answered in this mode,
+ * so the permission mode from config is passed through and Claude's own
+ * permission system decides what to allow. Output is buffered: onChunk fires
+ * once, after completion, with the full transcript. The opt-in PTY transport
+ * (claude-pty.ts, `claude.transport: "pty"`) streams chunks as they arrive.
  */
 export class ClaudeCliAdapter implements ClaudeAdapter {
   constructor(

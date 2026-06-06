@@ -1,6 +1,6 @@
 # Kairo Pipeline Test Report
 
-**Date:** 2026-06-06
+**Date:** 2026-06-07
 **Version under test:** kairo 0.1.0 (unreleased, local)
 **Verdict:** PASS at all four levels — ready for broader real-world use within documented v0 limitations.
 
@@ -13,7 +13,7 @@
 | pnpm | 11.5.1 |
 | Codex CLI (live runs) | codex-cli 0.137.0, authenticated via ChatGPT |
 | Claude Code (live runs) | 2.1.167 |
-| Codebase size | 3,145 lines src/ · 1,693 lines tests/ |
+| Codebase size | 3,939 lines src/ · 2,588 lines tests/ |
 
 ## 2. Test strategy
 
@@ -28,21 +28,27 @@ Four levels, each adding a real boundary the previous level mocked:
 
 ## 3. Level 0 — Automated suite
 
-**Result: 159/159 tests passed, 11 files. `tsc --noEmit`, ESLint, and build all clean.**
+**Result: 210/210 tests passed, 17 test files. `tsc --noEmit`, ESLint, and build all clean.**
 
 | File | Tests | Covers |
 |---|---|---|
 | safety.test.ts | 45 | destructive-command blocklist incl. bypass attempts (`rm -Rf`, split flags, `command`/`env`/var-prefix laundering), git-commit blocking |
+| orchestrator.test.ts (integration) | 34 | every loop path with mocked adapters: preflights, approval gate (approve/feedback/pause/bypass), self-edit split + sandbox discipline, delegation, revision loop + limits, multi-phase, transitional-failure verdicts, unknown check names, ask_user, blocked/unsafe/invalid-directive/claude-missing failure paths, risk-driven reports |
 | report.test.ts | 18 | commit-recommendation rules (safe / manual review / not safe), all report sections, blocker negation ("no blockers") |
 | directives.test.ts | 12 | schema validation, JSON extraction from fences/prose/bare objects, malformed-output failure modes |
-| task-store.test.ts | 10 | state model, history, persistence, partial-ID resolution |
+| resume.test.ts (integration) | 12 | checkpoint resumability from plan approval and user decisions, phase reconstruction on resume, dirty-tree resume rules, inspect pending metadata |
+| task-store.test.ts | 10 | state model, pending metadata, history, persistence, partial-ID resolution |
+| claude-adapters.test.ts | 10 | Claude adapter factory, PTY availability, argv prompt delivery, prompt-size guard, timeout/non-zero/spawn-failure behavior |
+| config.test.ts | 10 | schema defaults, invalid JSON/shape errors with `kairo init` guidance, Claude transport validation |
 | checks.test.ts | 9 | pass/fail/skip semantics, missing binaries & scripts, blocked destructive checks, unknown `only` names fallback |
+| init.test.ts | 8 | config creation, `.git/info/exclude` ignore behavior, idempotency, non-git behavior |
 | diff.test.ts | 8 | baseline capture, porcelain parsing (quoted/unicode/renamed paths), shell-safe untracked-file diffs |
-| config.test.ts | 7 | schema defaults, invalid JSON/shape errors with `kairo init` guidance |
+| phase-reconstruction.test.ts | 7 | phase artifact reconstruction, changed-file extraction from patches, missing-artifact placeholders |
 | prompts.test.ts | 6 | read-only triage contract, instructions-REQUIRED rule, self-edit prompt |
 | events.test.ts | 6 | NDJSON append/replay, malformed-line surfacing, listener fan-out |
+| claude-report-extraction.test.ts | 6 | report extraction from print/PTY transcripts, final-header selection, ANSI/OSC/control-byte sanitization |
+| ask-audit.test.ts (integration) | 5 | `kairo ask` records handled/unhandled messages honestly across success, missing Codex, and resume refusal |
 | process-runner.test.ts | 4 | `commandExists` shell-injection regressions (executed for real) |
-| orchestrator.test.ts (integration) | 34 | every loop path with mocked adapters: preflights, approval gate (approve/feedback/pause/bypass), self-edit split + sandbox discipline, delegation, revision loop + limits, multi-phase, transitional-failure verdicts, unknown check names, ask_user, blocked/unsafe/invalid-directive/claude-missing failure paths, risk-driven reports |
 
 ## 4. Level 1 — CLI smoke
 
@@ -50,7 +56,7 @@ Automated inside the L2 harness (`preflight_nongit`, `preflight_dirty`, `missing
 
 ## 5. Level 2 — Stub-CLI end-to-end
 
-`pnpm e2e:stub` — **14/14 scenarios passed.** Stub `codex`/`claude` executables (`scripts/e2e/bin/`) implement Kairo's exact CLI contracts; everything else is real: `ExecaProcessRunner`, both adapters, flag construction, stdin prompt delivery, `--output-last-message` files, git diff capture, check execution, artifact writing, PTY-interactive approval prompts.
+`pnpm e2e:stub` — **17/17 scenarios passed.** Stub `codex`/`claude` executables (`scripts/e2e/bin/`) implement Kairo's exact CLI contracts; everything else is real: `ExecaProcessRunner`, both Claude transports, adapter selection, flag construction, stdin/argv prompt delivery, `--output-last-message` files, git diff capture, check execution, artifact writing, and PTY-interactive approval prompts.
 
 | Scenario | Verified |
 |---|---|
@@ -58,10 +64,13 @@ Automated inside the L2 harness (`preflight_nongit`, `preflight_dirty`, `missing
 | missing_codex | friendly error naming `codex.command`, exit 1 |
 | happy_delegation | 12-artifact tree, real diff content, checks ran, report **safe to commit**, baseline note, sandboxes `triage:read-only → review:read-only` (asserted from stub argv logs) |
 | self_edit | separate write session (`workspace-write`), self-edit artifacts, approval bypassed, Claude untouched |
+| pty_delegation | delegated implementation through `claude.transport: "pty"`, real PTY subprocess, streamed transcript, real diff |
 | failed_check_revision | fail → `request_claude_revision` → second Claude run (revision flag set) → complete |
 | plan_feedback | feedback → `plan-feedback` Codex call → revised master-plan.md → revised instructions reached Claude → recorded in user-decisions.md |
 | plan_pause | non-interactive delegation pauses `awaiting_plan_approval`, report written, no Claude call |
 | ask_user | question rendered on terminal, PTY answer captured, Q&A in user-decisions.md |
+| ask_resume_plan | non-interactive plan pause persists `pending`; `kairo ask <id> y` resumes through Claude and clears pending |
+| ask_resume_decision | paused Codex question answered via `kairo ask`; post-decision plan gate re-pauses; second ask completes |
 | stop_blocked / stop_unsafe | correct terminal states/outcomes, **not safe to commit** |
 | invalid_directive | failed run, raw output saved to codex-triage-raw.txt |
 | claude_missing | fails at delegation with "required for delegated implementation", report written, no crash |
@@ -96,7 +105,18 @@ Automated inside the L2 harness (`preflight_nongit`, `preflight_dirty`, `missing
 | L-2 | Codex sent a command string (`"npm test"`) in `checksToRun`; the name filter silently matched zero checks — verification skipped invisibly | unknown names now fall back to running ALL configured checks with a visible event; review prompt lists exact configured names | checks.test.ts ×2, orchestrator.test.ts; validated live (run 7) |
 | L-3 | A transitional phase-1 check failure (fixed by phase 2) forced *not safe to commit* despite a green final tree | verdict now uses the latest result per check name; history remains in the event timeline | orchestrator.test.ts; validated live (run 7) |
 
-### 6.4 Issues found while building the harness
+### 6.4 Print + PTY transport validation
+
+After resumability and the Claude PTY transport stage, live validation was repeated against `codex-cli 0.137.0` and Claude Code `2.1.167` using the built CLI from `dist/`.
+
+| Transport | Result | Evidence |
+|---|---|---|
+| print (default) | PASS | quick self-edit task and forced multi-file Claude delegation both completed; `.git/info/exclude` init behavior kept the tree clean; reports were coherent and **safe to commit** |
+| PTY (opt-in) | FAIL → FIXED → PASS | first real run exposed that `claude --print` refuses TTY stdin; PTY now passes the prompt as an argv element, rejects prompts over ~180KB with print-mode guidance, preserves raw transcript, and sanitizes text used for `claude-report.md` and Codex review |
+
+Post-fix verification: `pnpm test` **210/210**, `pnpm e2e:stub` **17/17**, `pnpm typecheck`, `pnpm lint`, and `pnpm build` clean.
+
+### 6.5 Issues found while building the harness
 
 | ID | Issue | Status |
 |---|---|---|
@@ -110,24 +130,26 @@ Automated inside the L2 harness (`preflight_nongit`, `preflight_dirty`, `missing
 - **`ask_user` and plan-feedback live:** never naturally triggered; verified at L0/L2.
 - **Limits under live load** (maxPhases/maxRevisions/model calls/runtime): L0/L2 only.
 - **Claude interactive permission prompts:** untestable by design in v0 print mode (documented limitation).
+- **PTY soak testing:** validated with one real smoke pass; print remains default until PTY has more mileage.
 - **Long/concurrent runs:** single-task, short-run testing only; no locking exists (documented).
 
 ## 8. Defect history across the whole effort (context)
 
-29 defects found and fixed before live testing across three review rounds — including 4 high-severity safety-gate bypasses (`rm -Rf`, split flags, `command`/env-prefix laundering), shell-injection vectors in both adapters and `commandExists`, the unused plan-approval states, the triage/self-edit sandbox contradiction, and risk-blind reports. Live testing then found 3 more (L-1…L-3, §6.3) plus 1 open product issue (H-1). Every fixed defect has a regression test.
+29 defects found and fixed before live testing across three review rounds — including 4 high-severity safety-gate bypasses (`rm -Rf`, split flags, `command`/env-prefix laundering), shell-injection vectors in both adapters and `commandExists`, the unused plan-approval states, the triage/self-edit sandbox contradiction, and risk-blind reports. Live testing then found 3 more (L-1…L-3, §6.3), the fresh-repo init issue (H-1), and the real-Claude PTY prompt-delivery issue (§6.4). Every fixed defect has a regression test.
 
 ## 9. Reproduction
 
 ```bash
 pnpm test && pnpm typecheck && pnpm lint && pnpm build   # L0
-pnpm e2e:stub                                            # L1+L2 (14 scenarios)
+pnpm e2e:stub                                            # L1+L2 (17 scenarios)
 bash scripts/e2e/setup-sandbox.sh                        # L3 sandbox (real CLIs)
 node scripts/e2e/live-run.mjs <sandbox> "<task>"         # L3 driver (auto-approves plan)
 ```
 
 ## 10. Recommendations
 
-1. Fix H-1 (`kairo init` gitignore vs dirty-gate) before first-user onboarding — it breaks the happy path on a brand-new repo.
-2. Add `kairo resume` so `awaiting_plan_approval` / `awaiting_user_decision` pauses are continuable (currently re-run only).
-3. Run `pnpm e2e:stub` in CI; keep live runs manual and budgeted.
-4. Next live targets when budget allows: a task that genuinely triggers `request_claude_revision`, and a limits-exhaustion run.
+1. ~~Fix H-1 (`kairo init` gitignore vs dirty-gate)~~ — **done** (see §6.4).
+2. ~~Add `kairo resume`~~ — **done**: `kairo resume` and `kairo ask` provide checkpoint resumability for plan approval and Codex questions.
+3. ~~Validate Claude PTY transport against real Claude~~ — **done**: opt-in PTY transport passed live smoke testing after the argv prompt-delivery fix; print remains default.
+4. Run `pnpm e2e:stub` in CI; keep live runs manual and budgeted.
+5. Next product stage: run observability/control (better live status, transcript/log tailing, and clean interruption), not persistent sessions yet.
