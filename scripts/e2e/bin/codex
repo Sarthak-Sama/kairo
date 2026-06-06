@@ -1,0 +1,168 @@
+#!/usr/bin/env node
+/**
+ * Stub Codex CLI for Kairo end-to-end pipeline testing.
+ *
+ * Implements the exact interface Kairo's adapter calls:
+ *   codex exec --cd <dir> --sandbox <mode> --output-last-message <file> -
+ * with the prompt on stdin.
+ *
+ * Behavior is driven by:
+ *   KAIRO_E2E_SCENARIO  - which canned script to follow
+ *   KAIRO_E2E_STATE_DIR - where to keep call logs / counters
+ *
+ * Every invocation logs {call, argv, sandbox, promptType} to
+ * $KAIRO_E2E_STATE_DIR/codex-log.ndjson so the harness can assert
+ * sandbox discipline (planning read-only, self-edit write-enabled).
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+
+const scenario = process.env.KAIRO_E2E_SCENARIO || 'happy_delegation';
+const stateDir = process.env.KAIRO_E2E_STATE_DIR;
+if (!stateDir) {
+  console.error('stub codex: KAIRO_E2E_STATE_DIR not set');
+  process.exit(2);
+}
+
+const argv = process.argv.slice(2);
+function flagValue(name) {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : null;
+}
+const cd = flagValue('--cd');
+const sandbox = flagValue('--sandbox');
+const outFile = flagValue('--output-last-message');
+
+const prompt = fs.readFileSync(0, 'utf8');
+
+// Classify the prompt by markers from src/core/prompts.ts / orchestrator.ts.
+function classifyPrompt(p) {
+  if (p.includes('WRITE-ENABLED self-edit session')) return 'self-edit';
+  if (p.includes('reviewing an implementation phase')) return 'review';
+  if (p.includes('sent feedback instead of approving')) return 'plan-feedback';
+  if (p.includes('previously asked the user a question')) return 'after-user';
+  if (p.includes('classify the task')) return 'triage';
+  return 'unknown';
+}
+const promptType = classifyPrompt(prompt);
+
+// Bump the call counter and log this invocation.
+const counterFile = path.join(stateDir, 'codex-calls');
+const call = fs.existsSync(counterFile) ? Number(fs.readFileSync(counterFile, 'utf8')) + 1 : 1;
+fs.writeFileSync(counterFile, String(call));
+fs.appendFileSync(
+  path.join(stateDir, 'codex-log.ndjson'),
+  JSON.stringify({ call, argv, sandbox, promptType }) + '\n',
+);
+
+function directive(obj, prose) {
+  const full = {
+    actor: 'codex',
+    requiresUserInput: false,
+    risk: 'low',
+    reason: 'stub reason',
+    successCriteria: [],
+    checksToRun: [],
+    ...obj,
+  };
+  return `${prose}\n\n\`\`\`json\n${JSON.stringify(full, null, 2)}\n\`\`\``;
+}
+
+const DELEGATE = {
+  action: 'delegate_to_claude',
+  taskClass: 'single_phase_claude',
+  phase: 1,
+  reason: 'feature work suits delegation',
+  instructions: 'Create src/feature.txt containing a greeting line.',
+  successCriteria: ['src/feature.txt exists'],
+  checksToRun: ['test'],
+};
+
+function respond() {
+  switch (promptType) {
+    case 'triage':
+      switch (scenario) {
+        case 'happy_delegation':
+        case 'failed_check_revision':
+        case 'plan_feedback':
+        case 'plan_pause':
+        case 'claude_missing':
+          return directive(DELEGATE, '## Master Plan\nOne phase: create the feature file via Claude.');
+        case 'self_edit':
+        case 'self_edit_nodiff':
+          return directive(
+            {
+              action: 'self_edit',
+              taskClass: 'quick_self_edit',
+              reason: 'one-line change, delegation wasteful',
+              instructions: 'Append a changelog line to README.md.',
+              checksToRun: ['test'],
+            },
+            '## Plan\nQuick self-edit: append one line to README.md.',
+          );
+        case 'ask_user':
+          return directive(
+            { action: 'ask_user', question: 'Greeting in English or French?', reason: 'product wording decision' },
+            '## Plan\nNeed a product decision first.',
+          );
+        case 'stop_blocked':
+          return directive({ action: 'stop_blocked', reason: 'Task needs a service this repo does not have.' }, 'Cannot proceed.');
+        case 'stop_unsafe':
+          return directive({ action: 'stop_unsafe', risk: 'high', reason: 'Task asks to delete data.' }, 'Refusing.');
+        case 'invalid_directive':
+          return 'I think we should just refactor everything. No directive for you.';
+        default:
+          return directive(DELEGATE, 'Default plan.');
+      }
+
+    case 'self-edit': {
+      if (scenario === 'self_edit_nodiff') {
+        return 'Done. (stub intentionally made no changes)';
+      }
+      // Actually edit the repo so the diff/no-diff guard sees real changes.
+      fs.appendFileSync(path.join(cd, 'README.md'), '\nchangelog: stub self-edit was here\n');
+      return 'Edited README.md: appended one changelog line. No other files touched.';
+    }
+
+    case 'review': {
+      if (scenario === 'failed_check_revision') {
+        const marker = path.join(stateDir, 'review-count');
+        const n = fs.existsSync(marker) ? Number(fs.readFileSync(marker, 'utf8')) + 1 : 1;
+        fs.writeFileSync(marker, String(n));
+        if (n === 1) {
+          return directive(
+            {
+              action: 'request_claude_revision',
+              phase: 1,
+              reason: 'the test check failed',
+              instructions: 'Fix whatever made the test check fail, then re-verify.',
+              checksToRun: ['test'],
+            },
+            'Check failed — requesting a revision.',
+          );
+        }
+      }
+      return directive(
+        { action: 'declare_complete', reason: 'implementation matches the plan and checks pass' },
+        'Reviewed the diff against the plan. No blockers.',
+      );
+    }
+
+    case 'plan-feedback':
+      return directive(
+        { ...DELEGATE, instructions: 'Create src/feature.txt with a SHORTER greeting (user feedback applied).' },
+        '## Revised Plan\nSmaller scope per user feedback.',
+      );
+
+    case 'after-user':
+      return directive(DELEGATE, 'Proceeding with the user’s wording choice.');
+
+    default:
+      console.error(`stub codex: unrecognized prompt (scenario=${scenario})`);
+      process.exit(3);
+  }
+}
+
+const message = respond();
+if (outFile) fs.writeFileSync(outFile, message);
+console.log('[stub codex] responded to ' + promptType);

@@ -1,0 +1,6 @@
+node_modules/
+dist/
+coverage/
+.kairo/
+*.log
+.DS_Store
