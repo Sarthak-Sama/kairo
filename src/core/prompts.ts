@@ -7,7 +7,7 @@ import type { KairoConfig } from './config.js';
  * every call instead of relying on CLI session resume — see docs/architecture.md.
  */
 
-const DIRECTIVE_CONTRACT = `
+export const DIRECTIVE_CONTRACT = `
 You MUST end your reply with exactly one JSON object (a "directive") inside a \`\`\`json code fence.
 The directive schema:
 {
@@ -25,6 +25,7 @@ The directive schema:
 }
 
 Rules:
+- "actor" MUST be present and MUST be exactly "codex" in every directive — it is required, not optional.
 - "instructions" is REQUIRED for "self_edit", "delegate_to_claude", "request_claude_revision", and "continue_next_phase" — it must contain the complete, self-sufficient instructions for that edit/phase/revision. Kairo refuses these actions without instructions.
 - "checksToRun" entries must be NAMES from the configured checks list, exactly as listed — never shell commands. Unknown names cause ALL configured checks to run instead.
 - "ask_user" is ONLY for product/business/tradeoff/dangerous decisions, never for code-quality questions you can decide yourself.
@@ -187,6 +188,80 @@ ${input.instructions}
 
 ## Required final message
 End with a short markdown summary: what you changed, which files, and any caveats. Kairo captures the working-tree diff separately and will have your edits reviewed.`;
+}
+
+export function buildAfterUserDecisionPrompt(input: {
+  taskTitle: string;
+  masterPlan: string;
+  phaseContext: string;
+  question: string;
+  answer: string;
+}): string {
+  return `You previously asked the user a question while working on the task below.
+
+## Task
+${input.taskTitle}
+
+## Master plan
+${input.masterPlan}
+
+## Work completed so far
+${input.phaseContext}
+
+## Your question
+${input.question}
+
+## User's answer
+${input.answer}
+
+Continue the task with this answer. Reply with your reasoning and end with one directive JSON object.
+
+${DIRECTIVE_CONTRACT}`;
+}
+
+export function buildPlanFeedbackPrompt(input: {
+  taskTitle: string;
+  masterPlan: string;
+  feedback: string;
+}): string {
+  return `You are the agency head for Kairo. The user reviewed your plan for the task below and sent feedback instead of approving it. Revise your plan/directive accordingly.
+
+## Task
+${input.taskTitle}
+
+## Your current plan
+${input.masterPlan}
+
+## User feedback on the plan
+${input.feedback}
+
+Reply with your revised reasoning and end with one directive JSON object.
+
+${DIRECTIVE_CONTRACT}`;
+}
+
+/**
+ * One-shot recovery prompt: Codex's previous output failed directive
+ * validation (dogfood evidence: a substantively correct directive missing the
+ * required "actor" field). Codex is stateless, but its own raw output carries
+ * its full reasoning — ask it to re-emit the same decision validly.
+ */
+export function buildDirectiveRetryPrompt(input: {
+  purpose: string;
+  validationError: string;
+  rawOutput: string;
+}): string {
+  return `Your previous response to a Kairo "${input.purpose}" request could not be used because it failed directive validation.
+
+## Validation error
+${input.validationError}
+
+## Your previous output (for reference — your decision was likely fine; the FORMAT was not)
+${input.rawOutput.slice(0, 20000)}
+
+Re-state the SAME decision as exactly one valid directive JSON object in a \`\`\`json fence. Do not change your decision; fix the format. Every required field must be present.
+
+${DIRECTIVE_CONTRACT}`;
 }
 
 function truncate(text: string, max: number): string {

@@ -18,6 +18,8 @@ export interface ReportInput {
   risks: string[];
   /** True when diff capture was unavailable for any implementation phase. */
   diffUnavailable?: boolean;
+  /** Configured checks that never ran in any phase — listed, never implied passed. */
+  unrunCheckNames?: string[];
   /** One-line description of the git baseline (cleanliness, sha). */
   baselineNote?: string;
   scope: string;
@@ -127,11 +129,14 @@ export function generateReport(input: ReportInput): string {
   if (input.diffUnavailable) {
     lines.push('- **diff**: capture was UNAVAILABLE — changed-file evidence relies on agent self-reports only');
   }
-  if (input.checkResults.length === 0) {
+  if (input.checkResults.length === 0 && (input.unrunCheckNames ?? []).length === 0) {
     lines.push('No checks were run.');
   } else {
     for (const r of input.checkResults) {
       lines.push(`- **${r.name}** (\`${r.command}\`): ${r.status}${r.detail ? ` — ${r.detail}` : ''}`);
+    }
+    for (const name of input.unrunCheckNames ?? []) {
+      lines.push(`- **${name}**: NOT RUN — configured but never executed for this task`);
     }
   }
   lines.push('');

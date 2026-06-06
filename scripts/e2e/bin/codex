@@ -41,6 +41,7 @@ function classifyPrompt(p) {
   if (p.includes('reviewing an implementation phase')) return 'review';
   if (p.includes('sent feedback instead of approving')) return 'plan-feedback';
   if (p.includes('previously asked the user a question')) return 'after-user';
+  if (p.includes('failed directive validation')) return 'retry';
   if (p.includes('classify the task')) return 'triage';
   return 'unknown';
 }
@@ -156,6 +157,14 @@ function respond() {
 
     case 'after-user':
       return directive(DELEGATE, 'Proceeding with the user’s wording choice.');
+
+    case 'retry':
+      // invalid_directive scenario: stay invalid so the retry-failure path is
+      // exercised end-to-end; other scenarios recover with a valid directive.
+      if (scenario === 'invalid_directive') {
+        return 'Still refusing to emit JSON, as scripted.';
+      }
+      return directive(DELEGATE, 'Re-emitting the same decision in valid form.');
 
     default:
       console.error(`stub codex: unrecognized prompt (scenario=${scenario})`);

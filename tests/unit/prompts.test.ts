@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { buildSelfEditPrompt, buildTriagePrompt } from '../../src/core/prompts.js';
+import {
+  buildAfterUserDecisionPrompt,
+  buildDirectiveRetryPrompt,
+  buildPlanFeedbackPrompt,
+  buildSelfEditPrompt,
+  buildTriagePrompt,
+  DIRECTIVE_CONTRACT,
+} from '../../src/core/prompts.js';
 import { DEFAULT_CONFIG } from '../../src/core/config.js';
 
 describe('triage prompt', () => {
@@ -26,6 +33,44 @@ describe('triage prompt', () => {
     // Live finding: real Codex emitted continue_next_phase without
     // instructions because the contract never said they were mandatory.
     expect(prompt).toMatch(/"instructions" is REQUIRED for .*"continue_next_phase"/);
+  });
+});
+
+describe('directive contract centralization (dogfood fix 2)', () => {
+  it('the contract explicitly requires actor: "codex"', () => {
+    expect(DIRECTIVE_CONTRACT).toContain('"actor" MUST be present');
+    expect(DIRECTIVE_CONTRACT).toContain('"actor": "codex"');
+  });
+
+  it('after-user-decision prompt restates the full contract, not "same schema as before"', () => {
+    const prompt = buildAfterUserDecisionPrompt({
+      taskTitle: 'T',
+      masterPlan: 'P',
+      phaseContext: '(none)',
+      question: 'Q?',
+      answer: 'A.',
+    });
+    expect(prompt).toContain(DIRECTIVE_CONTRACT);
+    expect(prompt).not.toContain('same schema as before');
+  });
+
+  it('plan-feedback prompt restates the full contract', () => {
+    const prompt = buildPlanFeedbackPrompt({ taskTitle: 'T', masterPlan: 'P', feedback: 'smaller' });
+    expect(prompt).toContain(DIRECTIVE_CONTRACT);
+    expect(prompt).not.toContain('same schema as before');
+  });
+
+  it('retry prompt carries the error, the raw output, and the full contract', () => {
+    const prompt = buildDirectiveRetryPrompt({
+      purpose: 'after-user-decision',
+      validationError: 'actor: Invalid literal value, expected "codex"',
+      rawOutput: '{"action":"delegate_to_claude"}',
+    });
+    expect(prompt).toContain('after-user-decision');
+    expect(prompt).toContain('Invalid literal value');
+    expect(prompt).toContain('"action":"delegate_to_claude"');
+    expect(prompt).toContain(DIRECTIVE_CONTRACT);
+    expect(prompt).toContain('exactly one valid directive JSON object');
   });
 });
 

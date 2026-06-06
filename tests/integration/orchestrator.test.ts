@@ -395,17 +395,19 @@ describe('orchestrator (mocked adapters)', () => {
     expect(events.some((e) => e.action === 'stop_unsafe')).toBe(true);
   });
 
-  it('invalid directive from codex: saves raw output and fails visibly', async () => {
+  it('invalid directive from codex: retried once, then fails visibly with both raws saved', async () => {
     codex.enqueueRaw('I will just start refactoring everything now, trust me.');
+    codex.enqueueRaw('Still no directive from me on the retry either.');
 
     const outcome = await makeOrchestrator().run('Do something');
 
     expect(outcome.outcome).toBe('failed');
     const taskDir = store().taskDir(outcome.taskId);
-    expect(await fileExists(join(taskDir, 'codex-triage-raw.txt'))).toBe(true);
-    expect(await readText(join(taskDir, 'codex-triage-raw.txt'))).toContain('refactoring everything');
+    expect(await readText(join(taskDir, 'codex-triage-invalid-attempt-1.txt'))).toContain('refactoring everything');
+    expect(await readText(join(taskDir, 'codex-triage-raw.txt'))).toContain('Still no directive');
     const { events } = await readEventLog(join(taskDir, 'agency-log.ndjson'));
     expect(events.some((e) => e.action === 'triage' && e.status === 'failed')).toBe(true);
+    expect(events.some((e) => e.action === 'directive_retry' && e.status === 'failed')).toBe(true);
   });
 
   it('ask_user path: codex asks, user answers, codex proceeds to delegation', async () => {
@@ -645,6 +647,101 @@ describe('orchestrator (mocked adapters)', () => {
     expect(events.some((e) => e.actor === 'checks' && e.message.includes('1 passed'))).toBe(true);
   });
 
+  it('JSON-only review falls back to the decision reason in codex-review.md', async () => {
+    codex.enqueueDirective(
+      { action: 'delegate_to_claude', phase: 1, instructions: 'Build it.', checksToRun: ['test'] },
+      'Plan.',
+    );
+    claude.enqueueReport(1);
+    // Review with NO prose: directive JSON only.
+    codex.enqueueDirective({ action: 'declare_complete', risk: 'low', reason: 'implementation matches the plan and checks pass' });
+    planAnswers = ['y'];
+    statusAfterBaseline(' M src/x.ts');
+
+    const outcome = await makeOrchestrator().run('Build something');
+
+    expect(outcome.outcome).toBe('completed');
+    const review = await readText(join(store().taskDir(outcome.taskId), 'phase-001', 'codex-review.md'));
+    expect(review).toContain('(Codex returned no separate review prose.)');
+    expect(review).toContain('Decision: declare_complete');
+    expect(review).toContain('Reason: implementation matches the plan and checks pass');
+    expect(review).not.toBe('(no review prose)');
+    // The fallback also reaches the final report's review section.
+    const report = await readText(outcome.reportPath!);
+    expect(report).toContain('Decision: declare_complete');
+  });
+
+  describe('unrun configured checks in reports', () => {
+    function multiCheckConfig(): KairoConfig {
+      return ConfigSchema.parse({
+        version: 1,
+        checks: [
+          { name: 'typecheck', command: 'npx tsc --noEmit' },
+          { name: 'lint', command: 'npm run lint' },
+          { name: 'test', command: 'npm run test' },
+          { name: 'build', command: 'npm run build' },
+        ],
+      });
+    }
+
+    it('full suite run and passing → safe to commit, no NOT RUN lines', async () => {
+      config = multiCheckConfig();
+      codex.enqueueDirective(
+        { action: 'delegate_to_claude', phase: 1, instructions: 'Build.', checksToRun: [] }, // empty = all
+        'Plan.',
+      );
+      claude.enqueueReport(1);
+      codex.enqueueDirective({ action: 'declare_complete', reason: 'done' }, 'Reviewed, no blockers here.');
+      planAnswers = ['y'];
+      statusAfterBaseline(' M src/x.ts');
+
+      const outcome = await makeOrchestrator().run('Build something');
+      const report = await readText(outcome.reportPath!);
+      expect(report).not.toContain('NOT RUN');
+      expect(report).toContain('**safe to commit**');
+    });
+
+    it('subset run → unrun checks listed and needs manual review', async () => {
+      config = multiCheckConfig();
+      codex.enqueueDirective(
+        { action: 'delegate_to_claude', phase: 1, instructions: 'Build.', checksToRun: ['typecheck', 'test'] },
+        'Plan.',
+      );
+      claude.enqueueReport(1);
+      codex.enqueueDirective({ action: 'declare_complete', reason: 'done' }, 'Reviewed, no blockers here.');
+      planAnswers = ['y'];
+      statusAfterBaseline(' M src/x.ts');
+
+      const outcome = await makeOrchestrator().run('Build something');
+      const report = await readText(outcome.reportPath!);
+      expect(report).toContain('- **lint**: NOT RUN');
+      expect(report).toContain('- **build**: NOT RUN');
+      expect(report).toContain('never ran for this task (lint, build)');
+      expect(report).toContain('**needs manual review**');
+    });
+
+    it('a later full-suite run_checks restores the safe recommendation', async () => {
+      config = multiCheckConfig();
+      codex.enqueueDirective(
+        { action: 'delegate_to_claude', phase: 1, instructions: 'Build.', checksToRun: ['test'] },
+        'Plan.',
+      );
+      claude.enqueueReport(1);
+      codex.enqueueDirective(
+        { action: 'run_checks', reason: 'verify the full suite before closing', checksToRun: [] }, // all
+        'Want full verification.',
+      );
+      codex.enqueueDirective({ action: 'declare_complete', reason: 'done' }, 'Reviewed, no blockers here.');
+      planAnswers = ['y'];
+      statusAfterBaseline(' M src/x.ts');
+
+      const outcome = await makeOrchestrator().run('Build something');
+      const report = await readText(outcome.reportPath!);
+      expect(report).not.toContain('NOT RUN');
+      expect(report).toContain('**safe to commit**');
+    });
+  });
+
   it('high-risk directive makes the report not safe to commit even when checks pass', async () => {
     codex.enqueueDirective(
       { action: 'delegate_to_claude', taskClass: 'single_phase_claude', phase: 1, risk: 'high', instructions: 'Touch auth flow.' },
@@ -682,11 +779,51 @@ describe('requiresPlanApproval', () => {
     }
   });
 
-  it('bypasses approval only for quick/trivial low-risk self-edit', () => {
-    expect(requiresPlanApproval(directive({ action: 'self_edit', risk: 'low', taskClass: 'quick_self_edit' }))).toBe(false);
-    expect(requiresPlanApproval(directive({ action: 'self_edit', risk: 'medium', taskClass: 'trivial_fix' }))).toBe(false);
+  it('bypasses approval only for genuinely tiny low-risk self-edits', () => {
+    // typo/readme/copy-only changes bypass
+    expect(requiresPlanApproval(directive({
+      action: 'self_edit', risk: 'low', taskClass: 'quick_self_edit',
+      reason: 'one-word typo', instructions: 'Fix the typo in README.md.',
+    }))).toBe(false);
+    expect(requiresPlanApproval(directive({
+      action: 'self_edit', risk: 'low', taskClass: 'trivial_copy_change',
+      reason: 'marquee copy tweak', instructions: 'Change the marquee string in app/marquee-data.ts.',
+    }))).toBe(false);
     // No taskClass — be strict
     expect(requiresPlanApproval(directive({ action: 'self_edit', risk: 'low' }))).toBe(true);
+    // Medium risk no longer bypasses (was allowed before dogfood)
+    expect(requiresPlanApproval(directive({ action: 'self_edit', risk: 'medium', taskClass: 'trivial_fix' }))).toBe(true);
+  });
+
+  it('dogfood regression: feature-shaped self-edits no longer bypass the gate', () => {
+    // The Career Combini case: a full UI feature labeled quick_self_edit.
+    expect(requiresPlanApproval(directive({
+      action: 'self_edit', risk: 'low', taskClass: 'quick_self_edit',
+      reason: 'small and tightly scoped to the home page',
+      instructions: 'Add a client component for the receipt-style overlay and mount it from app/page.tsx.',
+    }))).toBe(true);
+    // new component
+    expect(requiresPlanApproval(directive({
+      action: 'self_edit', risk: 'low', taskClass: 'quick_self_edit',
+      reason: 'add a small component', instructions: 'Create a new component for the banner.',
+    }))).toBe(true);
+    // modal/dialog/overlay
+    for (const word of ['modal', 'dialog', 'overlay']) {
+      expect(requiresPlanApproval(directive({
+        action: 'self_edit', risk: 'low', taskClass: 'quick_self_edit',
+        reason: `add a ${word}`, instructions: `Build the ${word} markup.`,
+      }))).toBe(true);
+    }
+    // new route/page
+    expect(requiresPlanApproval(directive({
+      action: 'self_edit', risk: 'low', taskClass: 'quick_self_edit',
+      reason: 'add a route', instructions: 'Add a new page at /tools/x.',
+    }))).toBe(true);
+    // high risk
+    expect(requiresPlanApproval(directive({
+      action: 'self_edit', risk: 'high', taskClass: 'quick_self_edit',
+      reason: 'tiny', instructions: 'Edit one string.',
+    }))).toBe(true);
   });
 
   it('never gates routing/stop actions', () => {

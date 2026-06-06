@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import type { KairoConfig } from './config.js';
-import type { CodexAdapter } from '../adapters/codex.js';
+import type { CodexAdapter, CodexResult } from '../adapters/codex.js';
+import type { DirectiveParseResult } from './directives.js';
 import type { ClaudeAdapter } from '../adapters/claude.js';
 import type { ProcessRunner } from '../adapters/process-runner.js';
 import { TaskStore, isTerminalState, type Task, type PendingState } from './task-store.js';
@@ -9,7 +10,15 @@ import { EventLogger, readEventLog } from './events.js';
 import { scanRepo } from './repo-scanner.js';
 import { captureBaseline, captureDiff } from './diff.js';
 import { runChecks, type ChecksRun } from './checks.js';
-import { buildClaudePrompt, buildReviewPrompt, buildSelfEditPrompt, buildTriagePrompt } from './prompts.js';
+import {
+  buildAfterUserDecisionPrompt,
+  buildClaudePrompt,
+  buildDirectiveRetryPrompt,
+  buildPlanFeedbackPrompt,
+  buildReviewPrompt,
+  buildSelfEditPrompt,
+  buildTriagePrompt,
+} from './prompts.js';
 import { generateReport, reviewMentionsBlockers } from './report.js';
 import type { Directive } from './directives.js';
 import { createTaskId } from '../utils/ids.js';
@@ -72,11 +81,30 @@ export function requiresPlanApproval(directive: Directive): boolean {
     return true;
   }
   if (directive.action === 'self_edit') {
-    // Bypass only when Codex itself classified the work as quick/trivial.
-    return !(directive.taskClass && /quick|trivial/i.test(directive.taskClass));
+    // Dogfood evidence: Codex once labeled a 172-line interactive UI feature
+    // "quick_self_edit" and bypassed human plan review. Bypass now requires
+    // ALL objective constraints; anything feature-shaped goes to the user.
+    if (directive.risk !== 'low') return true;
+    if (!(directive.taskClass && /quick|trivial/i.test(directive.taskClass))) return true;
+    const text = [
+      directive.taskClass,
+      directive.reason,
+      directive.instructions ?? '',
+      directive.successCriteria.join(' '),
+    ].join(' ');
+    if (FEATURE_SIGNALS.test(text)) return true;
+    return false;
   }
   return true;
 }
+
+/**
+ * Words that suggest the "quick self-edit" is actually feature work — new
+ * surfaces, interaction, or structure. Deliberately conservative: a false
+ * positive only costs the user one approval prompt.
+ */
+const FEATURE_SIGNALS =
+  /\b(component|route|page|endpoint|api|provider|schema|migration|modal|dialog|overlay|form|hook|context|store|database|table)s?\b|new file|\.tsx\b|\.jsx\b/i;
 
 /**
  * The agency loop:
@@ -316,12 +344,11 @@ export class Orchestrator {
     if (!(await this.checkLimits(taskId, events))) {
       return this.finishBlocked(taskId, taskDir, events, [], 'limits reached before triage');
     }
-    const triage = await this.deps.codex.invokeForDirective({
+    const triage = await this.invokeCodexForDirective(taskId, taskDir, events, {
       purpose: 'triage',
       sandbox: 'read-only', // planning never gets write access
       prompt: buildTriagePrompt({ taskTitle: task.title, repoScanMarkdown: scan.markdown, config }),
     });
-    this.modelCalls++;
     await writeText(join(taskDir, 'codex-session.json'), JSON.stringify({
       invocations: [{ purpose: 'triage', exitCode: triage.result.exitCode, durationMs: triage.result.durationMs }],
     }, null, 2));
@@ -608,22 +635,10 @@ export class Orchestrator {
     masterPlan: string,
     feedback: string,
   ): Promise<{ revisedDirective: Directive; revisedPlan?: string } | { error: string }> {
-    this.modelCalls++;
-    const revised = await this.deps.codex.invokeForDirective({
+    const revised = await this.invokeCodexForDirective(task.id, taskDir, events, {
       purpose: 'plan-feedback',
       sandbox: 'read-only', // still planning — no write access
-      prompt: `You are the agency head for Kairo. The user reviewed your plan for the task below and sent feedback instead of approving it. Revise your plan/directive accordingly.
-
-## Task
-${task.title}
-
-## Your current plan
-${masterPlan}
-
-## User feedback on the plan
-${feedback}
-
-Reply with your revised reasoning and end with one directive JSON object in a \`\`\`json fence (same schema as before).`,
+      prompt: buildPlanFeedbackPrompt({ taskTitle: task.title, masterPlan, feedback }),
     });
     if (!revised.parsed.ok || !revised.parsed.directive) {
       await writeText(join(taskDir, 'codex-plan-feedback-raw.txt'), revised.parsed.rawOutput);
@@ -670,7 +685,7 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
       return this.finishBlocked(taskId, taskDir, events, phasesForReport, 'limits reached before review');
     }
     await events.log({ actor: 'codex', action: 'review', status: 'started', message: 'reviewing implementation' });
-    const review = await this.deps.codex.invokeForDirective({
+    const review = await this.invokeCodexForDirective(taskId, taskDir, events, {
       purpose: `review-phase-${phase}`,
       sandbox: 'read-only', // reviewing never gets write access
       prompt: buildReviewPrompt({
@@ -685,7 +700,6 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
         configuredCheckNames: this.deps.config.checks.map((c) => c.name),
       }),
     });
-    this.modelCalls++;
 
     if (!review.parsed.ok || !review.parsed.directive) {
       await writeText(join(phaseDir, 'codex-review-raw.txt'), review.parsed.rawOutput || review.result.rawStdout);
@@ -699,8 +713,15 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
     }
 
     record.review = extractProse(review.result.lastMessage);
+    if (!record.review) {
+      // Dogfood evidence: a JSON-only review left codex-review.md saying
+      // "(no review prose)" while real reasoning sat in the decision's
+      // `reason`. Surface it instead of losing it.
+      const d = review.parsed.directive;
+      record.review = `(Codex returned no separate review prose.)\n\nDecision: ${d.action}\nRisk: ${d.risk}\nReason: ${d.reason}`;
+    }
     record.reviewRisk = review.parsed.directive.risk;
-    await writeText(join(phaseDir, 'codex-review.md'), record.review || '(no review prose)');
+    await writeText(join(phaseDir, 'codex-review.md'), record.review);
     await writeJson(join(phaseDir, 'codex-decision.json'), review.parsed.directive);
     await events.log({
       actor: 'codex',
@@ -961,6 +982,73 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
     return checksRun;
   }
 
+  /**
+   * Invoke Codex for a directive with a one-shot retry on validation failure.
+   *
+   * Dogfood evidence: Codex returned a substantively correct directive that
+   * merely omitted the required "actor" field, and the whole run blocked.
+   * The retry feeds the validation error and Codex's own raw output back so
+   * it can re-emit the same decision in valid form. Both invalid attempts are
+   * saved as artifacts; every step is logged. Counts model calls and respects
+   * limits — if the limit is already reached, the retry is skipped.
+   */
+  private async invokeCodexForDirective(
+    taskId: string,
+    taskDir: string,
+    events: EventLogger,
+    invocation: { purpose: string; sandbox: string; prompt: string },
+  ): Promise<{ result: CodexResult; parsed: DirectiveParseResult }> {
+    this.modelCalls++;
+    const first = await this.deps.codex.invokeForDirective(invocation);
+    if (first.parsed.ok) return first;
+
+    const firstRawPath = join(taskDir, `codex-${slugifyPurpose(invocation.purpose)}-invalid-attempt-1.txt`);
+    await writeText(firstRawPath, first.parsed.rawOutput || first.result.rawStdout || '(no output)');
+    await events.log({
+      actor: 'codex',
+      action: 'directive_invalid',
+      status: 'failed',
+      message: `${invocation.purpose}: invalid directive (${first.parsed.error ?? 'unknown'}) — raw saved to ${firstRawPath}; retrying once`,
+    });
+
+    if (!(await this.checkLimits(taskId, events))) {
+      await events.log({
+        actor: 'kairo',
+        action: 'directive_retry',
+        status: 'skipped',
+        message: `${invocation.purpose}: retry skipped — model-call limit reached`,
+      });
+      return first;
+    }
+
+    await events.log({ actor: 'codex', action: 'directive_retry', status: 'started', message: `${invocation.purpose}: retrying with validation feedback` });
+    this.modelCalls++;
+    const retry = await this.deps.codex.invokeForDirective({
+      purpose: `${invocation.purpose}-retry`,
+      sandbox: 'read-only', // format recovery needs no write access
+      prompt: buildDirectiveRetryPrompt({
+        purpose: invocation.purpose,
+        validationError: first.parsed.error ?? 'unknown validation error',
+        rawOutput: first.parsed.rawOutput || first.result.rawStdout || '(no output)',
+      }),
+    });
+    if (retry.parsed.ok) {
+      await events.log({ actor: 'codex', action: 'directive_retry', status: 'completed', message: `${invocation.purpose}: retry produced a valid directive` });
+      return retry;
+    }
+    await writeText(
+      join(taskDir, `codex-${slugifyPurpose(invocation.purpose)}-invalid-attempt-2.txt`),
+      retry.parsed.rawOutput || retry.result.rawStdout || '(no output)',
+    );
+    await events.log({
+      actor: 'codex',
+      action: 'directive_retry',
+      status: 'failed',
+      message: `${invocation.purpose}: retry also failed validation (${retry.parsed.error ?? 'unknown'})`,
+    });
+    return retry;
+  }
+
   /** Append a question/answer pair (or note) to user-decisions.md. */
   private async recordDecision(taskDir: string, heading: string, answer: string): Promise<void> {
     await appendText(
@@ -991,7 +1079,6 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
     answer: string,
     phases: PhaseRecord[],
   ): Promise<Directive> {
-    this.modelCalls++;
     const phaseContext =
       phases.length === 0
         ? '(no implementation phases have run yet)'
@@ -1003,27 +1090,16 @@ Reply with your revised reasoning and end with one directive JSON object in a \`
               return `### Phase ${p.phase}\nChecks: ${checks}\nChanged files: ${p.changedFiles.join(', ') || '(none)'}\nReview: ${p.review || '(pending)'}\nImplementer report:\n${p.claudeReport.slice(0, 2000)}`;
             })
             .join('\n\n');
-    const followup = await this.deps.codex.invokeForDirective({
+    const followup = await this.invokeCodexForDirective(taskId, taskDir, events, {
       purpose: 'after-user-decision',
       sandbox: 'read-only', // deciding, not editing
-      prompt: `You previously asked the user a question while working on the task below.
-
-## Task
-${task.title}
-
-## Master plan
-${masterPlan}
-
-## Work completed so far
-${phaseContext}
-
-## Your question
-${directive.question ?? directive.reason}
-
-## User's answer
-${answer}
-
-Continue the task with this answer. Reply with your reasoning and end with one directive JSON object in a \`\`\`json fence (same schema as before: actions ask_user, self_edit, delegate_to_claude, request_claude_revision, run_checks, review_diff, continue_next_phase, declare_complete, stop_blocked, stop_unsafe).`,
+      prompt: buildAfterUserDecisionPrompt({
+        taskTitle: task.title,
+        masterPlan,
+        phaseContext,
+        question: directive.question ?? directive.reason,
+        answer,
+      }),
     });
     if (!followup.parsed.ok || !followup.parsed.directive) {
       await writeText(join(taskDir, 'codex-followup-raw.txt'), followup.parsed.rawOutput);
@@ -1165,6 +1241,14 @@ Continue the task with this answer. Reply with your reasoning and end with one d
     if (skippedChecks.length > 0) {
       risks.push(`medium: ${skippedChecks.length} check(s) were skipped (${skippedChecks.map((r) => r.name).join(', ')}) — verify manually`);
     }
+    // Configured checks that never ran in ANY phase: a later full-suite
+    // run_checks pass clears this (latest-per-name covers all names then).
+    const unrunCheckNames = this.deps.config.checks
+      .map((c) => c.name)
+      .filter((name) => !latestByName.has(name));
+    if (unrunCheckNames.length > 0 && phases.length > 0) {
+      risks.push(`medium: configured check(s) never ran for this task (${unrunCheckNames.join(', ')}) — verify manually`);
+    }
     if (reviewMentionsBlockers(codexReview)) {
       risks.push('high: Codex review mentions blockers');
     }
@@ -1185,6 +1269,7 @@ Continue the task with this answer. Reply with your reasoning and end with one d
       codexReview,
       risks,
       diffUnavailable,
+      unrunCheckNames,
       ...(baselineNote ? { baselineNote } : {}),
       scope: scope.slice(0, 4000),
       summary,
@@ -1194,6 +1279,11 @@ Continue the task with this answer. Reply with your reasoning and end with one d
     await writeText(reportPath, report);
     return reportPath;
   }
+}
+
+/** Make a purpose label filesystem-safe for artifact filenames. */
+function slugifyPurpose(purpose: string): string {
+  return purpose.replace(/[^a-zA-Z0-9-]+/g, '-');
 }
 
 /** Everything before the final ```json fence is treated as plan/review prose. */
