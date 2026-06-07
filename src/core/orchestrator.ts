@@ -1002,6 +1002,19 @@ export class Orchestrator {
     const first = await this.deps.codex.invokeForDirective(invocation);
     if (first.parsed.ok) return first;
 
+    // Retry is for FORMAT failures (Codex answered, JSON invalid). If the
+    // invocation itself failed (non-zero exit: quota, network, CLI error),
+    // a format-fix retry would just burn another call against the same wall.
+    if (!first.result.ok) {
+      await events.log({
+        actor: 'codex',
+        action: 'directive_invalid',
+        status: 'failed',
+        message: `${invocation.purpose}: Codex invocation failed (${first.result.error ?? 'unknown'}) — not retrying (not a format problem)`,
+      });
+      return first;
+    }
+
     const firstRawPath = join(taskDir, `codex-${slugifyPurpose(invocation.purpose)}-invalid-attempt-1.txt`);
     await writeText(firstRawPath, first.parsed.rawOutput || first.result.rawStdout || '(no output)');
     await events.log({

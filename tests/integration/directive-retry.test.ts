@@ -146,6 +146,19 @@ describe('one-shot directive retry (mocked adapters)', () => {
     expect(events.some((e) => e.action === 'directive_retry' && e.status === 'failed')).toBe(true);
   });
 
+  it('does NOT retry invocation failures (quota/network/CLI errors) — only format failures', async () => {
+    // Live regression evidence: a ChatGPT usage-limit exit-1 triggered a
+    // pointless format-fix retry against the same quota wall.
+    // Empty mock queue -> invoke() itself fails (ok: false).
+    const outcome = await makeOrchestrator().run('Do something');
+
+    expect(outcome.outcome).toBe('failed');
+    expect(codex.invocations).toHaveLength(1); // no second call
+    const { events } = await readEventLog(join(store().taskDir(outcome.taskId), 'agency-log.ndjson'));
+    expect(events.some((e) => e.action === 'directive_retry')).toBe(false);
+    expect(events.some((e) => e.message.includes('not retrying (not a format problem)'))).toBe(true);
+  });
+
   it('model-call limits still apply: no retry when the limit is already reached', async () => {
     config = ConfigSchema.parse({
       version: 1,
