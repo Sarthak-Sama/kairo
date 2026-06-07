@@ -74,6 +74,13 @@ export const TaskSchema = z.object({
   revisionCount: z.number().int().min(0).default(0),
   modelCalls: z.number().int().min(0).default(0),
   outcome: z.string().nullable().default(null),
+  /** User-defined profile name used for this run; null = none (roles/default). */
+  profile: z.string().nullable().default(null),
+  /** Providers that filled the roles for this run; legacy tasks load null. */
+  team: z
+    .object({ head: z.enum(['codex', 'claude']), developmentLead: z.enum(['codex', 'claude']) })
+    .nullable()
+    .default(null),
   // Tasks created before resumability load with pending: null.
   pending: PendingSchema.default(null),
   stateHistory: z
@@ -118,7 +125,13 @@ export class TaskStore {
     return join(this.taskDir(taskId), `phase-${String(phase).padStart(3, '0')}`);
   }
 
-  async createTask(input: { id: string; title: string; repoRoot: string }): Promise<Task> {
+  async createTask(input: {
+    id: string;
+    title: string;
+    repoRoot: string;
+    profile?: string | null;
+    team?: { head: 'codex' | 'claude'; developmentLead: 'codex' | 'claude' } | null;
+  }): Promise<Task> {
     const now = this.clock().toISOString();
     const existing = await fileExists(this.taskJsonPath(input.id));
     if (existing) {
@@ -136,6 +149,8 @@ export class TaskStore {
       revisionCount: 0,
       modelCalls: 0,
       outcome: null,
+      profile: input.profile ?? null,
+      team: input.team ?? null,
       pending: null,
       stateHistory: [{ state: 'created', at: now }],
     };

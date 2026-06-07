@@ -54,7 +54,8 @@ export async function askCommand(repoRoot: string, taskIdPartial: string, messag
   }
 
   const runner = new ExecaProcessRunner();
-  const team = createAgentTeam(runner, config, repoRoot);
+  // Continue with the team the task started with; profiles never change mid-task.
+  const team = createAgentTeam(runner, config, repoRoot, task.team ?? undefined);
   const timeline = new TimelineRenderer();
 
   if (!(await team.head.isAvailable())) {

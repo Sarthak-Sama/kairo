@@ -10,16 +10,30 @@ export const CheckSchema = z.object({
 export const AgentProviderSchema = z.enum(['codex', 'claude']);
 export type AgentProvider = z.infer<typeof AgentProviderSchema>;
 
-export const ConfigSchema = z.object({
-  version: z.literal(1),
-  artifactDir: z.string().default('.kairo'),
-  /** Which provider fills each agency role. Defaults preserve the original team. */
-  roles: z
-    .object({
-      head: AgentProviderSchema.default('codex'),
-      developmentLead: AgentProviderSchema.default('claude'),
-    })
-    .default({}),
+export const TeamRolesSchema = z.object({
+  head: AgentProviderSchema,
+  developmentLead: AgentProviderSchema,
+});
+export type TeamRoles = z.infer<typeof TeamRolesSchema>;
+
+export const ConfigSchema = z
+  .object({
+    version: z.literal(1),
+    artifactDir: z.string().default('.kairo'),
+    /** Which provider fills each agency role. Defaults preserve the original team. */
+    roles: z
+      .object({
+        head: AgentProviderSchema.default('codex'),
+        developmentLead: AgentProviderSchema.default('claude'),
+      })
+      .default({}),
+    /**
+     * User-defined operating profiles — arbitrary names chosen by the user
+     * (e.g. "daily", "review-heavy"). Kairo attaches no meaning to the names.
+     */
+    profiles: z.record(z.string().min(1, 'profile names must be non-empty'), TeamRolesSchema).default({}),
+    /** Profile used when `--profile` is not passed; must exist in `profiles`. */
+    defaultProfile: z.string().nullable().default(null),
   limits: z
     .object({
       maxPhases: z.number().int().positive().default(6),
@@ -47,12 +61,50 @@ export const ConfigSchema = z.object({
     })
     .default({}),
   checks: z.array(CheckSchema).default([]),
-  scanner: z
-    .object({
-      exclude: z.array(z.string()).default([]),
-    })
-    .default({}),
-});
+    scanner: z
+      .object({
+        exclude: z.array(z.string()).default([]),
+      })
+      .default({}),
+  })
+  .superRefine((config, ctx) => {
+    if (config.defaultProfile !== null && !(config.defaultProfile in config.profiles)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['defaultProfile'],
+        message: `defaultProfile "${config.defaultProfile}" does not exist in profiles (configured: ${Object.keys(config.profiles).join(', ') || 'none'})`,
+      });
+    }
+  });
+
+/** The team configuration resolved for one run. */
+export interface ResolvedTeam {
+  profile: string | null;
+  head: AgentProvider;
+  developmentLead: AgentProvider;
+}
+
+/**
+ * Resolution order: explicit `--profile` > `defaultProfile` > `roles`
+ * (which itself defaults to the original codex-head/claude-dev team).
+ */
+export function resolveTeam(config: KairoConfig, explicitProfile?: string): ResolvedTeam {
+  if (explicitProfile !== undefined) {
+    const profile = config.profiles[explicitProfile];
+    if (!profile) {
+      throw new ConfigError(
+        `unknown profile "${explicitProfile}" — configured profiles: ${Object.keys(config.profiles).join(', ') || '(none)'}`,
+      );
+    }
+    return { profile: explicitProfile, ...profile };
+  }
+  if (config.defaultProfile !== null) {
+    // Validated by the schema to exist.
+    const profile = config.profiles[config.defaultProfile]!;
+    return { profile: config.defaultProfile, ...profile };
+  }
+  return { profile: null, head: config.roles.head, developmentLead: config.roles.developmentLead };
+}
 
 export type KairoConfig = z.infer<typeof ConfigSchema>;
 export type CheckConfig = z.infer<typeof CheckSchema>;
@@ -64,6 +116,8 @@ export const DEFAULT_CONFIG: KairoConfig = {
     head: 'codex',
     developmentLead: 'claude',
   },
+  profiles: {},
+  defaultProfile: null,
   limits: {
     maxPhases: 6,
     maxRevisionLoopsPerPhase: 3,

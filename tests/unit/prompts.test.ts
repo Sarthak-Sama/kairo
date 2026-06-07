@@ -17,6 +17,7 @@ describe('triage prompt', () => {
     taskTitle: 'Fix typo',
     repoScanMarkdown: '# Repo Scan\n- Files: 3',
     config: DEFAULT_CONFIG,
+    developmentLeadProvider: 'claude',
   });
 
   it('declares the session read-only and forbids editing during triage', () => {

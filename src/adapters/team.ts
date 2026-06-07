@@ -1,5 +1,5 @@
 import type { ProcessRunner } from './process-runner.js';
-import type { KairoConfig, AgentProvider } from '../core/config.js';
+import { resolveTeam, type KairoConfig, type AgentProvider } from '../core/config.js';
 import { CodexCliAdapter } from './codex.js';
 import { createClaudeAdapter } from './claude-factory.js';
 import { ClaudeCliAdapter } from './claude.js';
@@ -66,15 +66,25 @@ export interface AgentTeam {
   developmentLead: DevelopmentLeadAdapter;
 }
 
-/** Build the agency team from config.roles. Defaults: Codex head, Claude development lead. */
-export function createAgentTeam(runner: ProcessRunner, config: KairoConfig, repoRoot: string): AgentTeam {
+/**
+ * Build the agency team. By default the team is resolved from config
+ * (explicit profile > defaultProfile > roles); pass `team` to pin specific
+ * providers — e.g. the team stored on a task being resumed.
+ */
+export function createAgentTeam(
+  runner: ProcessRunner,
+  config: KairoConfig,
+  repoRoot: string,
+  team?: { head: AgentProvider; developmentLead: AgentProvider },
+): AgentTeam {
+  const resolved = team ?? resolveTeam(config);
   return {
     head:
-      config.roles.head === 'codex'
+      resolved.head === 'codex'
         ? new CodexHeadAdapter(runner, config, repoRoot)
         : new ClaudeHeadAdapter(runner, config, repoRoot),
     developmentLead:
-      config.roles.developmentLead === 'codex'
+      resolved.developmentLead === 'codex'
         ? new CodexDevelopmentLeadAdapter(runner, config, repoRoot)
         : new ClaudeDevelopmentLeadAdapter(runner, config, repoRoot),
   };

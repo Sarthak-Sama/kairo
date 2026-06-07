@@ -11,6 +11,7 @@ import { resumeCommand } from './commands/resume.js';
 import { askCommand } from './commands/ask.js';
 import { stopCommand } from './commands/stop.js';
 import { noteCommand } from './commands/note.js';
+import { profilesCommand } from './commands/profiles.js';
 import { ConfigError } from './core/config.js';
 
 const program = new Command();
@@ -45,8 +46,16 @@ program
 program
   .command('run')
   .argument('<task>', 'task description')
-  .description('Run a task through the Codex/Claude agency loop')
-  .action((task: string) => wrap(() => runCommand(repoRoot, task))());
+  .option('--profile <name>', 'user-defined operating profile from .kairo/config.json')
+  .description('Run a task through the agency loop')
+  .action((task: string, options: { profile?: string }) =>
+    wrap(() => runCommand(repoRoot, task, options))(),
+  );
+
+program
+  .command('profiles')
+  .description('List configured operating profiles and the effective default team')
+  .action(wrap(() => profilesCommand(repoRoot)));
 
 program
   .command('resume')

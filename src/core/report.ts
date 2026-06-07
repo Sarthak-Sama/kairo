@@ -22,6 +22,12 @@ export interface ReportInput {
   unrunCheckNames?: string[];
   /** True when the task made no changes at all (e.g. stopped before implementation). */
   nothingToCommit?: boolean;
+  /** Operating profile metadata: user-defined name (or null) and the resolved team. */
+  operatingProfile?: {
+    profile: string | null;
+    head: string;
+    developmentLead: string;
+  };
   /** One-line description of the git baseline (cleanliness, sha). */
   baselineNote?: string;
   scope: string;
@@ -93,6 +99,14 @@ export function generateReport(input: ReportInput): string {
   lines.push('');
   lines.push(outcome);
   lines.push('');
+  if (input.operatingProfile) {
+    lines.push('## Operating Profile');
+    lines.push('');
+    lines.push(`- Profile: ${input.operatingProfile.profile ?? 'none'}`);
+    lines.push(`- Head planner/reviewer: ${input.operatingProfile.head}`);
+    lines.push(`- Development lead: ${input.operatingProfile.developmentLead}`);
+    lines.push('');
+  }
   lines.push('## Scope');
   lines.push('');
   lines.push(input.scope || '(no scope recorded)');

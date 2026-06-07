@@ -1,15 +1,22 @@
 import { join } from 'node:path';
-import { loadConfig } from '../core/config.js';
+import { loadConfig, resolveTeam } from '../core/config.js';
 import { Orchestrator } from '../core/orchestrator.js';
 import { ExecaProcessRunner } from '../adapters/process-runner.js';
 import { createAgentTeam } from '../adapters/team.js';
 import { TimelineRenderer } from '../renderers/timeline.js';
 import { makeApprovePlan, makeAskUser } from './interactive.js';
 
-export async function runCommand(repoRoot: string, taskTitle: string): Promise<void> {
+export async function runCommand(
+  repoRoot: string,
+  taskTitle: string,
+  options: { profile?: string } = {},
+): Promise<void> {
   const config = await loadConfig(repoRoot); // throws with "run kairo init" guidance if missing
+  // Resolve the operating team BEFORE any model call: explicit --profile >
+  // defaultProfile > roles. Unknown profiles fail right here.
+  const resolved = resolveTeam(config, options.profile);
   const runner = new ExecaProcessRunner();
-  const team = createAgentTeam(runner, config, repoRoot);
+  const team = createAgentTeam(runner, config, repoRoot, resolved);
   const timeline = new TimelineRenderer();
 
   // The head agent is required up front — every run starts with head triage.
@@ -34,6 +41,7 @@ export async function runCommand(repoRoot: string, taskTitle: string): Promise<v
     runner,
     askUser,
     approvePlan,
+    profileName: resolved.profile,
     onEvent: (event) => timeline.render(event),
   });
 

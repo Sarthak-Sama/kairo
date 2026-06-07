@@ -41,10 +41,14 @@ function formatTaskLines(task: Task, lastEvent: AgencyEvent | undefined): string
   const lastLine = lastEvent
     ? `${actorTag(lastEvent)} ${lastEvent.action} (${lastEvent.status}) — ${truncate(lastEvent.message, 90)}`
     : '(no events)';
+  const teamLine = task.team
+    ? `profile: ${task.profile ?? 'none'} (head=${task.team.head}, development=${task.team.developmentLead})`
+    : null;
   return [
     `  ${task.id}`,
     `    ${task.state}${phase}  outcome: ${task.outcome ?? '-'}${waiting}`,
     `    title:   ${truncate(task.title, 100)}`,
+    ...(teamLine ? [`    ${teamLine}`] : []),
     `    last:    ${lastLine}`,
     `    updated: ${task.updatedAt}`,
     '',

@@ -38,9 +38,11 @@ export function buildTriagePrompt(input: {
   taskTitle: string;
   repoScanMarkdown: string;
   config: KairoConfig;
+  /** The RESOLVED development-lead provider for this run (profile-aware). */
+  developmentLeadProvider: string;
 }): string {
   const checkNames = input.config.checks.map((c) => c.name).join(', ') || '(none configured)';
-  const devLead = input.config.roles.developmentLead;
+  const devLead = input.developmentLeadProvider;
   return `You are the agency head for a local coding task runtime called Kairo.
 Your role: inspect the repository, classify the task, and produce a plan plus a directive.
 This is a READ-ONLY planning session: you may read files and run non-destructive commands to inspect the repo, but you must not modify anything. If you decide on "self_edit", Kairo will invoke you again in a separate write-enabled session to perform the edits.

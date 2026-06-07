@@ -37,6 +37,8 @@ export interface OrchestratorDeps {
    * feedback for Codex, or null to pause (no interactive channel / no answer).
    */
   approvePlan: (planPath: string) => Promise<string | null>;
+  /** User-defined profile name this run was resolved from; null = none. */
+  profileName?: string | null;
   onEvent?: (event: import('./events.js').AgencyEvent) => void;
   clock?: () => Date;
 }
@@ -148,6 +150,11 @@ export class Orchestrator {
       id: taskId,
       title: taskTitle,
       repoRoot: this.deps.repoRoot,
+      profile: this.deps.profileName ?? null,
+      team: {
+        head: this.deps.head.provider,
+        developmentLead: this.deps.developmentLead.provider,
+      },
     });
     const taskDir = this.store.taskDir(taskId);
     const events = this.newEvents(taskDir);
@@ -365,7 +372,12 @@ export class Orchestrator {
     const triage = await this.invokeHeadForDirective(taskId, taskDir, events, {
       purpose: 'triage',
       access: 'read', // planning never gets write access
-      prompt: buildTriagePrompt({ taskTitle: task.title, repoScanMarkdown: scan.markdown, config }),
+      prompt: buildTriagePrompt({
+        taskTitle: task.title,
+        repoScanMarkdown: scan.markdown,
+        config,
+        developmentLeadProvider: this.deps.developmentLead.provider,
+      }),
     });
     await writeText(join(taskDir, 'head-session.json'), JSON.stringify({
       invocations: [{ purpose: 'triage', exitCode: triage.result.exitCode, durationMs: triage.result.durationMs }],
@@ -1442,6 +1454,13 @@ export class Orchestrator {
       diffUnavailable,
       unrunCheckNames,
       nothingToCommit,
+      operatingProfile: {
+        profile: task.profile,
+        // Stored team is canonical; legacy tasks display the current deps team
+        // (without pretending a profile existed).
+        head: task.team?.head ?? this.deps.head.provider,
+        developmentLead: task.team?.developmentLead ?? this.deps.developmentLead.provider,
+      },
       ...(baselineNote ? { baselineNote } : {}),
       scope: scope.slice(0, 4000),
       summary,

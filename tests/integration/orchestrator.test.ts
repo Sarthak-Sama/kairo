@@ -775,6 +775,64 @@ describe('orchestrator (mocked adapters)', () => {
     });
   });
 
+  describe('operating profile metadata', () => {
+    it('task.json stores profile and team; report carries the Operating Profile section', async () => {
+      head = new MockHeadAdapter('claude');
+      developmentLead = new MockDevLeadAdapter('claude');
+      head.enqueueDirective(
+        { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build.', checksToRun: ['test'] },
+        'Plan.',
+      );
+      developmentLead.enqueueReport(1);
+      head.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+      planAnswers = ['y'];
+      statusAfterBaseline(' M src/x.ts');
+
+      const orchestrator = new Orchestrator({
+        config,
+        repoRoot,
+        head,
+        developmentLead,
+        runner,
+        askUser: async () => userAnswers.shift() ?? null,
+        approvePlan: async () => planAnswers.shift() ?? null,
+        profileName: 'daily',
+      });
+      const outcome = await orchestrator.run('Build something');
+
+      expect(outcome.outcome).toBe('completed');
+      const task = await store().getTask(outcome.taskId);
+      expect(task.profile).toBe('daily');
+      expect(task.team).toEqual({ head: 'claude', developmentLead: 'claude' });
+      const report = await readText(outcome.reportPath!);
+      expect(report).toContain('## Operating Profile');
+      expect(report).toContain('- Profile: daily');
+      expect(report).toContain('- Head planner/reviewer: claude');
+      expect(report).toContain('- Development lead: claude');
+    });
+
+    it('no profile: task stores null profile and the current team; report says none', async () => {
+      head.enqueueDirective({ action: 'stop_blocked', reason: 'nope' });
+
+      const outcome = await makeOrchestrator().run('Blocked task');
+
+      const task = await store().getTask(outcome.taskId);
+      expect(task.profile).toBeNull();
+      expect(task.team).toEqual({ head: 'codex', developmentLead: 'claude' });
+      const report = await readText(outcome.reportPath!);
+      expect(report).toContain('- Profile: none');
+    });
+
+    it('triage prompt names the resolved development-lead provider', async () => {
+      developmentLead = new MockDevLeadAdapter('codex');
+      head.enqueueDirective({ action: 'stop_blocked', reason: 'just checking the prompt' });
+
+      await makeOrchestrator().run('Anything');
+
+      expect(head.invocations[0]?.prompt).toContain('the development lead is codex');
+    });
+  });
+
   it('high-risk directive makes the report not safe to commit even when checks pass', async () => {
     head.enqueueDirective(
       { action: 'delegate_to_development_lead', taskClass: 'single_phase_claude', phase: 1, risk: 'high', instructions: 'Touch auth flow.' },

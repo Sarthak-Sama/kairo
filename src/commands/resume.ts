@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { loadConfig } from '../core/config.js';
 import { Orchestrator } from '../core/orchestrator.js';
+import { TaskStore } from '../core/task-store.js';
 import { ExecaProcessRunner } from '../adapters/process-runner.js';
 import { createAgentTeam } from '../adapters/team.js';
 import { TimelineRenderer } from '../renderers/timeline.js';
@@ -10,7 +11,13 @@ import { makeApprovePlan, makeAskUser } from './interactive.js';
 export async function resumeCommand(repoRoot: string, taskIdPartial: string): Promise<void> {
   const config = await loadConfig(repoRoot);
   const runner = new ExecaProcessRunner();
-  const team = createAgentTeam(runner, config, repoRoot);
+  // A resumed task continues with the TEAM it started with (stored on the
+  // task); profiles cannot change mid-task. Legacy tasks without stored team
+  // metadata fall back to the current config resolution.
+  const store = new TaskStore(join(repoRoot, config.artifactDir));
+  const taskId = await store.resolveTaskId(taskIdPartial);
+  const task = await store.getTask(taskId);
+  const team = createAgentTeam(runner, config, repoRoot, task.team ?? undefined);
   const timeline = new TimelineRenderer();
 
   if (!(await team.head.isAvailable())) {
@@ -32,7 +39,7 @@ export async function resumeCommand(repoRoot: string, taskIdPartial: string): Pr
     onEvent: (event) => timeline.render(event),
   });
 
-  const outcome = await orchestrator.resume(taskIdPartial);
+  const outcome = await orchestrator.resume(taskId);
   if (outcome.outcome === 'still_paused') {
     timeline.info(`task ${outcome.taskId} remains paused (${outcome.finalState}) — no answer provided`);
     return;

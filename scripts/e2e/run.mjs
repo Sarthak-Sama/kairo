@@ -273,6 +273,55 @@ const SCENARIOS = {
     return { sandbox, stateDir };
   },
 
+  async profile_run(check) {
+    // User-defined profiles: --profile resolves the team, task.json records
+    // it, the report carries the Operating Profile section, and `kairo
+    // profiles` lists what is configured.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox, { codexCommand: 'definitely-missing-codex-xyz' });
+    const configPath = join(sandbox, '.kairo', 'config.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.profiles = {
+      daily: { head: 'claude', developmentLead: 'claude' },
+      'review-heavy': { head: 'codex', developmentLead: 'claude' },
+    };
+    config.defaultProfile = null;
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    const env = makeEnv('happy_delegation', stateDir);
+
+    // Unknown profile fails before any model call.
+    const bad = await runPlain(sandbox, env, ['run', '--profile', 'nonexistent', 'Add a greeting feature']);
+    check(bad.code === 1, `unknown profile exits 1 (got ${bad.code})`);
+    check(bad.out.includes('unknown profile "nonexistent"'), 'unknown profile error is clear');
+    check(!existsSync(join(stateDir, 'claude-log.ndjson')), 'no model call for unknown profile');
+
+    // `kairo profiles` lists configured profiles.
+    const list = await runPlain(sandbox, env, ['profiles']);
+    check(list.out.includes('daily') && list.out.includes('head=claude'), 'profiles listed');
+    check(list.out.includes('review-heavy') && list.out.includes('head=codex'), 'second profile listed');
+
+    // Run with --profile daily (claude/claude): codex is absent and unneeded.
+    const first = await runPlain(sandbox, env, ['run', '--profile', 'daily', 'Add a greeting feature']);
+    check(first.code === 0, `run exits 0 (got ${first.code})`);
+    let task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.profile === 'daily', `task stores profile (got ${task.profile})`);
+    check(task.team?.head === 'claude' && task.team?.developmentLead === 'claude', 'task stores team');
+    check(task.state === 'awaiting_plan_approval', 'paused at gate');
+
+    // Resume via ask uses the STORED team (still no codex needed).
+    const second = await runPlain(sandbox, env, ['ask', taskId(sandbox), 'y']);
+    check(second.code === 0, `ask exits 0 (got ${second.code})`);
+    task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.outcome === 'completed', `completed (got ${task.outcome})`);
+    const report = readArtifact(sandbox, 'report.md');
+    check(report.includes('## Operating Profile'), 'report has the section');
+    check(report.includes('- Profile: daily'), 'report records the profile name');
+    check(report.includes('- Development lead: claude'), 'report records the team');
+    check(!existsSync(join(stateDir, 'codex-log.ndjson')), 'zero codex invocations across the whole flow');
+    return { sandbox, stateDir };
+  },
+
   async claude_head_team(check) {
     // Role-selectable team: Claude as head AND development lead. Codex is
     // deliberately absent (missing command) — the run must not need it.

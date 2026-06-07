@@ -21,6 +21,10 @@ export async function inspectCommand(repoRoot: string, taskIdPartial: string): P
   console.log(`  updated:     ${task.updatedAt}`);
   console.log(`  phase:       ${task.currentPhase}`);
   console.log(`  model calls: ${task.modelCalls}`);
+  console.log(`  profile:     ${task.profile ?? 'none'}`);
+  console.log(
+    `  team:        ${task.team ? `head=${task.team.head} development=${task.team.developmentLead}` : '(not recorded — legacy task)'}`,
+  );
   if (task.baseline) {
     console.log(
       `  baseline:    ${task.baseline.isGitRepo ? `${task.baseline.branch}@${task.baseline.headSha?.slice(0, 8)}${task.baseline.dirty ? ' (dirty)' : ''}` : 'not a git repo'}`,

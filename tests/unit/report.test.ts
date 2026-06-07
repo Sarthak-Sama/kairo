@@ -16,6 +16,8 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     revisionCount: 0,
     modelCalls: 3,
     outcome: 'completed',
+    profile: null,
+    team: null,
     pending: null,
     stateHistory: [],
     ...overrides,
@@ -180,6 +182,26 @@ describe('report generation', () => {
       baselineNote: 'clean working tree at main@abc12345 before implementation',
     });
     expect(report).toContain('**baseline**: clean working tree at main@abc12345');
+  });
+
+  it('renders the operating profile section with a profile name', () => {
+    const report = generateReport({
+      ...baseInput,
+      operatingProfile: { profile: 'daily', head: 'claude', developmentLead: 'claude' },
+    });
+    expect(report).toContain('## Operating Profile');
+    expect(report).toContain('- Profile: daily');
+    expect(report).toContain('- Head planner/reviewer: claude');
+    expect(report).toContain('- Development lead: claude');
+  });
+
+  it('renders profile: none when no profile was used', () => {
+    const report = generateReport({
+      ...baseInput,
+      operatingProfile: { profile: null, head: 'codex', developmentLead: 'claude' },
+    });
+    expect(report).toContain('- Profile: none');
+    expect(report).toContain('- Head planner/reviewer: codex');
   });
 
   it('reflects failed outcome in the Outcome section', () => {
