@@ -12,6 +12,7 @@ import { askCommand } from './commands/ask.js';
 import { stopCommand } from './commands/stop.js';
 import { noteCommand } from './commands/note.js';
 import { profilesCommand } from './commands/profiles.js';
+import { tuiCommand } from './commands/tui.js';
 import { ConfigError } from './core/config.js';
 
 const program = new Command();
@@ -51,6 +52,12 @@ program
   .action((task: string, options: { profile?: string }) =>
     wrap(() => runCommand(repoRoot, task, options))(),
   );
+
+program
+  .command('tui')
+  .argument('[task-id]', 'task id (or unique fragment) to focus')
+  .description('Open the operator console: supervise, approve, answer, note, and stop tasks')
+  .action((taskId: string | undefined) => wrap(() => tuiCommand(repoRoot, taskId))());
 
 program
   .command('profiles')

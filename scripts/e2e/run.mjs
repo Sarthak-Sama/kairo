@@ -496,6 +496,60 @@ const SCENARIOS = {
     return { sandbox, stateDir };
   },
 
+  async tui_smoke(check) {
+    // Operator console driven through a real PTY against a paused task:
+    // render, note (n), approve (y), and verify the run completes.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox, {
+      codexCommand: 'definitely-missing-codex-xyz',
+      roles: { head: 'claude', developmentLead: 'claude' },
+    });
+    const env = makeEnv('happy_delegation', stateDir);
+
+    const first = await runPlain(sandbox, env, 'Add a greeting feature');
+    check(first.code === 0, `run pauses at gate (got ${first.code})`);
+
+    // Drive the TUI state-by-state: each step waits for its on-screen cue.
+    const result = await new Promise((resolveTui) => {
+      const proc = pty.spawn(process.execPath, [CLI, 'tui'], { cwd: sandbox, env, cols: 140, rows: 45 });
+      let out = '';
+      let step = 0;
+      const timer = setTimeout(() => { proc.kill(); resolveTui({ out: out + '\n[harness] TIMEOUT', code: -1 }); }, 60_000);
+      proc.onData((d) => {
+        out += d;
+        const clean = out.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+        if (step === 0 && clean.includes('Pending: approve plan')) {
+          step = 1;
+          setTimeout(() => proc.write('n'), 400); // open note input after a settled render
+        } else if (step === 1 && clean.includes('note>')) {
+          step = 2;
+          // Return must be a separate write: inside one chunk it is treated
+          // as pasted text, not as the submit key.
+          setTimeout(() => proc.write('Reviewed via TUI smoke test.'), 200);
+          setTimeout(() => proc.write('\r'), 500);
+        } else if (step === 2 && clean.includes('note recorded')) {
+          step = 3;
+          setTimeout(() => proc.write('y'), 300); // approve
+        } else if (step === 3 && clean.includes('task finished: completed')) {
+          step = 4;
+          setTimeout(() => proc.write('q'), 300);
+        }
+      });
+      proc.onExit(({ exitCode }) => { clearTimeout(timer); resolveTui({ out, code: exitCode }); });
+    });
+
+    check(result.code === 0, `tui exits cleanly (got ${result.code})`);
+    check(result.out.includes('Tasks (1)'), 'task list rendered');
+    check(result.out.includes('Pending:'), 'pending block rendered');
+    check(result.out.includes('approve plan (y)'), 'approval hint rendered');
+    const task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.outcome === 'completed', `task completed via TUI approve (got ${task.outcome})`);
+    check(readArtifact(sandbox, 'manager-notes.md').includes('Reviewed via TUI smoke test.'), 'note recorded via TUI');
+    check(task.pending === null, 'pending cleared');
+    return { sandbox, stateDir };
+  },
+
   async cancel_inflight(check) {
     // True in-flight cancellation: the stub dev lead streams partial output
     // and hangs; `kairo stop` runs in parallel and the owned child must die.

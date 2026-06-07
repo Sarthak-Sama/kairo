@@ -114,7 +114,8 @@ describe('kairo ask audit honesty', () => {
     await writeConfig({}); // codex resolves to `echo`, which exists
     await writeText(join(repoRoot, 'src', 'wip.ts'), '// uncommitted user work\n');
 
-    await expect(askCommand(repoRoot, taskId, 'y')).rejects.toThrow(/commit or stash/);
+    await askCommand(repoRoot, taskId, 'y');
+    expect(process.exitCode).toBe(1); // refusal reported via exit code now
 
     const [line] = await readMessages(taskId);
     expect(line?.handled).toBe(false);
