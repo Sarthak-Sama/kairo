@@ -5,6 +5,7 @@ import { createClaudeAdapter } from './claude-factory.js';
 import { ClaudeCliAdapter } from './claude.js';
 import type { ClaudeAdapter } from './claude.js';
 import { parseDirective, type DirectiveParseResult } from '../core/directives.js';
+import type { CancellationSignal } from '../core/cancellation.js';
 
 export type { AgentProvider } from '../core/config.js';
 
@@ -18,6 +19,8 @@ export interface ModelResult {
   exitCode: number | null;
   durationMs: number;
   error?: string;
+  /** True when the invocation was terminated by a user cancellation. */
+  cancelled?: boolean;
 }
 
 export interface HeadInvocation {
@@ -30,6 +33,8 @@ export interface HeadInvocation {
    * implementation permissionMode).
    */
   access: 'read' | 'write';
+  /** Fired by `kairo stop`: the owned child process is terminated. */
+  cancellation?: CancellationSignal;
 }
 
 export interface HeadAgentAdapter {
@@ -46,12 +51,16 @@ export interface ImplementationResult {
   exitCode: number | null;
   durationMs: number;
   error?: string;
+  /** True when the invocation was terminated by a user cancellation. */
+  cancelled?: boolean;
 }
 
 export interface DevLeadInvocation {
   prompt: string;
   purpose: string;
   onChunk?: (chunk: string) => void;
+  /** Fired by `kairo stop`: the owned child process is terminated. */
+  cancellation?: CancellationSignal;
 }
 
 export interface DevelopmentLeadAdapter {
@@ -110,6 +119,7 @@ export class CodexHeadAdapter implements HeadAgentAdapter {
       prompt: invocation.prompt,
       purpose: invocation.purpose,
       sandbox: invocation.access === 'read' ? 'read-only' : this.config.codex.sandbox,
+      ...(invocation.cancellation ? { cancellation: invocation.cancellation } : {}),
     });
     return {
       ok: result.ok,
@@ -118,6 +128,7 @@ export class CodexHeadAdapter implements HeadAgentAdapter {
       exitCode: result.exitCode,
       durationMs: result.durationMs,
       ...(result.error ? { error: result.error } : {}),
+      ...(result.cancelled ? { cancelled: true } : {}),
     };
   }
 
@@ -149,6 +160,7 @@ export class CodexDevelopmentLeadAdapter implements DevelopmentLeadAdapter {
       prompt: invocation.prompt,
       purpose: invocation.purpose,
       sandbox: this.config.codex.sandbox,
+      ...(invocation.cancellation ? { cancellation: invocation.cancellation } : {}),
     });
     const transcript = result.rawStdout || result.lastMessage;
     invocation.onChunk?.(transcript); // codex exec is not streaming; one chunk at completion
@@ -158,6 +170,7 @@ export class CodexDevelopmentLeadAdapter implements DevelopmentLeadAdapter {
       exitCode: result.exitCode,
       durationMs: result.durationMs,
       ...(result.error ? { error: result.error } : {}),
+      ...(result.cancelled ? { cancelled: true } : {}),
     };
   }
 }
@@ -187,6 +200,7 @@ export class ClaudeHeadAdapter implements HeadAgentAdapter {
         invocation.access === 'read'
           ? this.config.claude.headPermissionMode
           : this.config.claude.permissionMode,
+      ...(invocation.cancellation ? { cancellation: invocation.cancellation } : {}),
     });
     return {
       ok: result.ok,
@@ -195,6 +209,7 @@ export class ClaudeHeadAdapter implements HeadAgentAdapter {
       exitCode: result.exitCode,
       durationMs: result.durationMs,
       ...(result.error ? { error: result.error } : {}),
+      ...(result.cancelled ? { cancelled: true } : {}),
     };
   }
 
@@ -225,6 +240,7 @@ export class ClaudeDevelopmentLeadAdapter implements DevelopmentLeadAdapter {
       prompt: invocation.prompt,
       purpose: invocation.purpose,
       ...(invocation.onChunk ? { onChunk: invocation.onChunk } : {}),
+      ...(invocation.cancellation ? { cancellation: invocation.cancellation } : {}),
     });
     return {
       ok: result.ok,
@@ -232,6 +248,7 @@ export class ClaudeDevelopmentLeadAdapter implements DevelopmentLeadAdapter {
       exitCode: result.exitCode,
       durationMs: result.durationMs,
       ...(result.error ? { error: result.error } : {}),
+      ...(result.cancelled ? { cancelled: true } : {}),
     };
   }
 }

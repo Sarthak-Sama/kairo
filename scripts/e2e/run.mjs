@@ -496,6 +496,61 @@ const SCENARIOS = {
     return { sandbox, stateDir };
   },
 
+  async cancel_inflight(check) {
+    // True in-flight cancellation: the stub dev lead streams partial output
+    // and hangs; `kairo stop` runs in parallel and the owned child must die.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox, {
+      codexCommand: 'definitely-missing-codex-xyz',
+      roles: { head: 'claude', developmentLead: 'claude' },
+    });
+    const env = makeEnv('slow_dev', stateDir);
+
+    // Head triage/review prompts get answered normally even in slow_dev (the
+    // stub branches on role first), so run to the gate, approve, and the dev
+    // phase will hang.
+    const first = await runPlain(sandbox, env, 'Add a greeting feature');
+    check(first.code === 0, `run pauses at gate (got ${first.code})`);
+
+    // Approve in the background; while implementation hangs, stop the task.
+    const askPromise = runPlain(sandbox, env, ['ask', taskId(sandbox), 'y']);
+    const pidFile = join(stateDir, 'slow-dev-pid');
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(pidFile) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    check(existsSync(pidFile), 'slow dev process started');
+    const devPid = Number(readFileSync(pidFile, 'utf8'));
+
+    const stop = await runPlain(sandbox, env, ['stop', taskId(sandbox), '--reason', 'Testing in-flight cancellation.']);
+    check(stop.code === 0, `stop exits 0 (got ${stop.code})`);
+    check(stop.out.includes('cancelled at the next transport check'), 'stop is honest about cancellation timing');
+
+    const ask = await askPromise; // the runner observes cancellation and finalizes
+    // A user-requested stop is a fulfilled instruction, not a failure: exit 0
+    // (matching `kairo stop` on paused tasks).
+    check(ask.code === 0, `cancelled run exits 0 (got ${ask.code})`);
+    check(ask.out.includes('stopped_by_user'), 'runner reports the stopped outcome');
+
+    const task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.state === 'blocked' && task.outcome === 'stopped_by_user', `stopped (got ${task.state}/${task.outcome})`);
+    const transcript = readArtifact(sandbox, 'phase-001/development-lead-transcript.log');
+    check(transcript.includes('PARTIAL: started implementing'), 'partial transcript preserved');
+    const report = readArtifact(sandbox, 'report.md');
+    check(report.includes('cancelled mid-flight'), 'report flags mid-flight cancellation');
+    check(report.includes('not safe to commit'), 'not safe to commit');
+    // The owned child is actually dead.
+    let alive = true;
+    try {
+      process.kill(devPid, 0);
+    } catch {
+      alive = false;
+    }
+    check(!alive, `slow dev child terminated (pid ${devPid})`);
+    return { sandbox, stateDir };
+  },
+
   async stop_and_note(check) {
     // Supervision control through the real CLI: note a paused task, stop it,
     // verify the terminal state and that resume refuses.

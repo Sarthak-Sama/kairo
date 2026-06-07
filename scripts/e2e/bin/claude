@@ -76,6 +76,16 @@ if (role === 'head-review') {
   process.exit(0);
 }
 
+// Slow-development scenario: print partial output, record our PID, then hang
+// until killed — used to test in-flight cancellation of an owned child.
+if (process.env.KAIRO_E2E_SCENARIO === 'slow_dev') {
+  const featurePath0 = path.join(process.cwd(), 'src', 'feature.txt');
+  fs.mkdirSync(path.dirname(featurePath0), { recursive: true });
+  fs.appendFileSync(featurePath0, 'partial work before cancellation\n');
+  process.stdout.write('PARTIAL: started implementing, this will take a while...\n');
+  fs.writeFileSync(path.join(stateDir, 'slow-dev-pid'), String(process.pid));
+  setInterval(() => {}, 1000); // hang until killed
+} else {
 // Make a real change in the working tree.
 const featurePath = path.join(process.cwd(), 'src', 'feature.txt');
 fs.mkdirSync(path.dirname(featurePath), { recursive: true });
@@ -92,3 +102,4 @@ console.log(`Working on phase ${phase}...
 none
 ## Phase Complete
 yes — feature file ${isRevision ? 'revised' : 'created'} per instructions`);
+}

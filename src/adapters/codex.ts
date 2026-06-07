@@ -17,6 +17,8 @@ export interface CodexInvocation {
    * Defaults to the config sandbox when omitted.
    */
   sandbox?: string;
+  /** Fired by `kairo stop`: the owned `codex exec` child is terminated. */
+  cancellation?: import('../core/cancellation.js').CancellationSignal;
 }
 
 export interface CodexResult {
@@ -27,6 +29,8 @@ export interface CodexResult {
   exitCode: number | null;
   durationMs: number;
   error?: string;
+  /** True when the invocation was terminated by a user cancellation. */
+  cancelled?: boolean;
 }
 
 export interface CodexAdapter {
@@ -84,6 +88,7 @@ export class CodexCliAdapter implements CodexAdapter {
       timeoutMs: 20 * 60 * 1000,
       // Composed by Kairo from config + fixed flags; the sandbox is Codex's own.
       skipSafetyCheck: true,
+      ...(invocation.cancellation ? { cancellation: invocation.cancellation } : {}),
     });
 
     let lastMessage = '';
@@ -93,6 +98,20 @@ export class CodexCliAdapter implements CodexAdapter {
     if (!lastMessage) {
       // Fall back to stdout if --output-last-message produced nothing.
       lastMessage = run.stdout.trim();
+    }
+
+    if (run.cancelled) {
+      const reason = (await invocation.cancellation?.reason()) ?? 'no reason recorded';
+      return {
+        ok: false,
+        cancelled: true,
+        lastMessage,
+        rawStdout: run.stdout, // partial output collected before termination
+        rawStderr: run.stderr,
+        exitCode: run.exitCode,
+        durationMs: run.durationMs,
+        error: `cancelled by user: ${reason}`,
+      };
     }
 
     const ok = run.exitCode === 0 && lastMessage.length > 0;

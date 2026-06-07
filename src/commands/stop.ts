@@ -36,8 +36,10 @@ export async function stopCommand(repoRoot: string, taskIdPartial: string, reaso
     timeline.info(`artifacts: ${join(repoRoot, config.artifactDir, 'tasks', outcome.taskId)}`);
     return;
   }
-  // Cooperative path: be honest about what this can and cannot do.
-  timeline.info(`stop recorded for ${outcome.taskId} (state: ${outcome.finalState})`);
-  timeline.info('an active runner will stop at its next safe boundary; Kairo does not kill running model processes');
+  // Active task: the signal is written; an active transport will terminate
+  // its owned child at the next cancellation poll. Never claim "stopped"
+  // until the orchestrator actually observes it.
+  timeline.info(`stop requested for ${outcome.taskId}; active process will be cancelled at the next transport check`);
+  timeline.info('Kairo only terminates child processes it owns — never by name, never globally');
   timeline.info('if no runner is alive, the request persists and applies on the next resume');
 }

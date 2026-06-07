@@ -31,7 +31,8 @@ export async function inspectCommand(repoRoot: string, taskIdPartial: string): P
     );
   }
   // Stopped tasks must be unmistakable.
-  const stopPath = join(taskDir, 'stop-requested.json');
+  let stopPath = join(taskDir, 'control.json');
+  if (!(await fileExists(stopPath))) stopPath = join(taskDir, 'stop-requested.json');
   if (await fileExists(stopPath)) {
     try {
       const stop = await readJson<{ reason?: string; requestedAt?: string }>(stopPath);

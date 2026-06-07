@@ -5,6 +5,7 @@ import type { DirectiveParseResult } from './directives.js';
 import type { ProcessRunner } from '../adapters/process-runner.js';
 import { TaskStore, isTerminalState, type Task, type PendingState } from './task-store.js';
 import { reconstructPhases, type PhaseRecord } from './phase-reconstruction.js';
+import { FileCancellationSignal, type CancellationSignal } from './cancellation.js';
 import { EventLogger, readEventLog } from './events.js';
 import { scanRepo } from './repo-scanner.js';
 import { captureBaseline, captureDiff } from './diff.js';
@@ -286,6 +287,9 @@ export class Orchestrator {
       await this.setPending(taskId, null);
       await events.log({ actor: 'user', action: 'plan_feedback', status: 'completed', message: 'user sent plan feedback to codex (resume)' });
       const revision = await this.requestPlanRevision(taskDir, events, task, masterPlan, answer);
+      if ('cancelled' in revision) {
+        return this.finishCancelled(taskId, taskDir, events, phases, 'head plan revision');
+      }
       if ('error' in revision) {
         return this.finishFailed(taskId, taskDir, events, phases, revision.error);
       }
@@ -383,6 +387,9 @@ export class Orchestrator {
       invocations: [{ purpose: 'triage', exitCode: triage.result.exitCode, durationMs: triage.result.durationMs }],
     }, null, 2));
 
+    if (triage.result.cancelled) {
+      return this.finishCancelled(taskId, taskDir, events, [], 'head triage');
+    }
     if (!triage.parsed.ok || !triage.parsed.directive) {
       await writeText(join(taskDir, 'head-triage-raw.txt'), triage.parsed.rawOutput || triage.result.raw);
       await events.log({
@@ -507,6 +514,12 @@ export class Orchestrator {
             return this.finishFailed(taskId, taskDir, events, phases, implemented.error);
           }
           const record = implemented.record;
+          if (implemented.cancelledDuring) {
+            // An owned process was terminated mid-call: preserve the partial
+            // phase record (diff already captured), stop honestly, no review.
+            const phasesWithCancelled = phases.filter((p) => p.phase !== phase).concat(record);
+            return this.finishCancelled(taskId, taskDir, events, phasesWithCancelled, implemented.cancelledDuring);
+          }
 
           // Safe boundary: honor a stop that arrived during implementation —
           // the phase record is preserved; review/checks are honestly skipped.
@@ -665,6 +678,9 @@ export class Orchestrator {
       return this.finishBlocked(taskId, taskDir, events, phases, 'limits reached while revising plan');
     }
     const revision = await this.requestPlanRevision(taskDir, events, task, masterPlan, answer);
+    if ('cancelled' in revision) {
+      return this.finishCancelled(taskId, taskDir, events, phases, 'head plan revision');
+    }
     if ('error' in revision) {
       return this.finishFailed(taskId, taskDir, events, phases, revision.error);
     }
@@ -678,12 +694,15 @@ export class Orchestrator {
     task: Task,
     masterPlan: string,
     feedback: string,
-  ): Promise<{ revisedDirective: Directive; revisedPlan?: string } | { error: string }> {
+  ): Promise<{ revisedDirective: Directive; revisedPlan?: string } | { error: string } | { cancelled: true }> {
     const revised = await this.invokeHeadForDirective(task.id, taskDir, events, {
       purpose: 'plan-feedback',
       access: 'read', // still planning — no write access
       prompt: buildPlanFeedbackPrompt({ taskTitle: task.title, masterPlan, feedback }),
     });
+    if (revised.result.cancelled) {
+      return { cancelled: true };
+    }
     if (!revised.parsed.ok || !revised.parsed.directive) {
       await writeText(join(taskDir, 'head-plan-feedback-raw.txt'), revised.parsed.rawOutput);
       await events.log({
@@ -747,6 +766,9 @@ export class Orchestrator {
       }),
     });
 
+    if (review.result.cancelled) {
+      return this.finishCancelled(taskId, taskDir, events, phasesForReport, 'head review');
+    }
     if (!review.parsed.ok || !review.parsed.directive) {
       await writeText(join(phaseDir, 'codex-review-raw.txt'), review.parsed.rawOutput || review.result.raw);
       await events.log({
@@ -794,8 +816,9 @@ export class Orchestrator {
     phase: number,
     isRevision: boolean,
     phases: PhaseRecord[],
-  ): Promise<{ record: PhaseRecord } | { error: string }> {
+  ): Promise<{ record: PhaseRecord; cancelledDuring?: string } | { error: string }> {
     let claudeReport = '';
+    let cancelledDuring: string | undefined;
 
     if (directive.action === 'self_edit') {
       // Triage is read-only, so the edits have NOT happened yet: run a
@@ -827,28 +850,33 @@ export class Orchestrator {
         purpose: `self-edit-phase-${phase}`,
         access: 'write', // the only write-enabled head call
         prompt: selfEditPrompt,
+        cancellation: this.cancellationFor(taskDir),
       });
       this.modelCalls++;
       await writeText(
         join(phaseDir, 'head-self-edit-transcript.md'),
         result.output || result.raw || '(no output)',
       );
-      if (!result.ok) {
+      if (result.cancelled) {
+        cancelledDuring = 'head self-edit';
+        claudeReport = `(head self-edit CANCELLED mid-flight — partial transcript preserved)\n\n${result.output || '(no output collected)'}`;
+      } else if (!result.ok) {
         await events.log({
           actor: 'head',
           action: 'self_edit',
           status: 'failed',
           message: `head self-edit invocation failed: ${result.error ?? 'unknown error'}`,
         });
-        return { error: `Codex self-edit invocation failed: ${result.error ?? 'unknown error'}` };
+        return { error: `head self-edit invocation failed: ${result.error ?? 'unknown error'}` };
+      } else {
+        await events.log({
+          actor: 'head',
+          action: 'self_edit',
+          status: 'completed',
+          message: `head self-edit session finished for phase ${phase}`,
+        });
+        claudeReport = `(head self-edit — no development-lead involvement)\n\n${result.output}`;
       }
-      await events.log({
-        actor: 'head',
-        action: 'self_edit',
-        status: 'completed',
-        message: `head self-edit session finished for phase ${phase}`,
-      });
-      claudeReport = `(Codex self-edit — no Claude involvement)\n\n${result.output}`;
     } else {
       if (!directive.instructions) {
         await events.log({
@@ -905,6 +933,7 @@ export class Orchestrator {
       const result = await this.deps.developmentLead.invoke({
         purpose: `phase-${phase}${isRevision ? '-revision' : ''}`,
         prompt,
+        cancellation: this.cancellationFor(taskDir),
         onChunk: (chunk) => {
           streamedBytes += chunk.length;
           // Each link handles its own rejection so the chain can never become
@@ -937,17 +966,24 @@ export class Orchestrator {
         lastInvocation: { purpose: `phase-${phase}`, exitCode: result.exitCode, durationMs: result.durationMs },
       }, null, 2));
 
-      if (!result.ok) {
+      if (result.cancelled) {
+        // Owned process terminated by `kairo stop`. Partial transcript is
+        // already on disk; fall through to diff capture, skip checks/review.
+        cancelledDuring = 'development lead implementation';
+        claudeReport = `(development lead implementation CANCELLED mid-flight — partial transcript preserved)\n\n${result.transcript.slice(-2000)}`;
+        await writeText(join(phaseDir, 'development-lead-report.md'), claudeReport);
+      } else if (!result.ok) {
         await events.log({
           actor: 'development_lead',
           action: isRevision ? 'revise' : 'implement',
           status: 'failed',
-          message: `Claude invocation failed: ${result.error ?? 'unknown error'}`,
+          message: `development lead invocation failed: ${result.error ?? 'unknown error'}`,
         });
-        return { error: `Claude invocation failed: ${result.error ?? 'unknown error'}` };
+        return { error: `development lead invocation failed: ${result.error ?? 'unknown error'}` };
+      } else {
+        claudeReport = extractClaudeReport(result.transcript);
+        await writeText(join(phaseDir, 'development-lead-report.md'), claudeReport);
       }
-      claudeReport = extractClaudeReport(result.transcript);
-      await writeText(join(phaseDir, 'development-lead-report.md'), claudeReport);
       await events.log({
         actor: 'development_lead',
         action: isRevision ? 'revise' : 'implement',
@@ -969,6 +1005,25 @@ export class Orchestrator {
         : (diff.note ?? 'diff unavailable'),
     });
 
+    // Cancelled mid-flight: the partial phase record (with the captured diff)
+    // goes back to the caller, which finalizes the stop. No checks, no review.
+    if (cancelledDuring) {
+      return {
+        record: {
+          phase,
+          claudeReport,
+          checksRun: null,
+          changedFiles: diff.changedFiles,
+          review: '',
+          directiveRisk: directive.risk,
+          reviewRisk: null,
+          diffAvailable: diff.available,
+          ...(diff.note !== undefined ? { diffNote: diff.note } : {}),
+        },
+        cancelledDuring,
+      };
+    }
+
     // A self-edit that changed nothing means no work actually happened —
     // fail the run instead of letting an empty phase sail through review.
     if (directive.action === 'self_edit' && diff.available && diff.changedFiles.length === 0) {
@@ -978,7 +1033,7 @@ export class Orchestrator {
         status: 'failed',
         message: 'the head self-edit session produced no working-tree changes',
       });
-      return { error: 'Codex self-edit session produced no working-tree changes' };
+      return { error: 'the head self-edit session produced no working-tree changes' };
     }
 
     // Safe boundary: a stop requested mid-implementation skips checks; the
@@ -1067,10 +1122,16 @@ export class Orchestrator {
     invocation: { purpose: string; access: 'read' | 'write'; prompt: string },
   ): Promise<{ result: ModelResult; parsed: DirectiveParseResult }> {
     this.modelCalls++;
-    const first = await this.deps.head.invokeForDirective(invocation);
+    const first = await this.deps.head.invokeForDirective({
+      ...invocation,
+      cancellation: this.cancellationFor(taskDir),
+    });
     if (first.parsed.ok) return first;
 
-    // Retry is for FORMAT failures (Codex answered, JSON invalid). If the
+    // Cancelled by the user mid-call: never retry; callers route to a stop.
+    if (first.result.cancelled) return first;
+
+    // Retry is for FORMAT failures (the head answered, JSON invalid). If the
     // invocation itself failed (non-zero exit: quota, network, CLI error),
     // a format-fix retry would just burn another call against the same wall.
     if (!first.result.ok) {
@@ -1078,7 +1139,7 @@ export class Orchestrator {
         actor: 'head',
         action: 'directive_invalid',
         status: 'failed',
-        message: `${invocation.purpose}: Codex invocation failed (${first.result.error ?? 'unknown'}) — not retrying (not a format problem)`,
+        message: `${invocation.purpose}: head invocation failed (${first.result.error ?? 'unknown'}) — not retrying (not a format problem)`,
       });
       return first;
     }
@@ -1107,6 +1168,7 @@ export class Orchestrator {
     const retry = await this.deps.head.invokeForDirective({
       purpose: `${invocation.purpose}-retry`,
       access: 'read', // format recovery needs no write access
+      cancellation: this.cancellationFor(taskDir),
       prompt: buildDirectiveRetryPrompt({
         purpose: invocation.purpose,
         validationError: first.parsed.error ?? 'unknown validation error',
@@ -1181,7 +1243,8 @@ export class Orchestrator {
 
     const events = this.newEvents(taskDir);
     await events.log({ actor: 'user', action: 'stop_requested', status: 'completed', message: `stop requested: ${reason}` });
-    await writeJson(join(taskDir, 'stop-requested.json'), {
+    await writeJson(join(taskDir, 'control.json'), {
+      stopRequested: true,
       reason,
       requestedAt: this.clock().toISOString(),
     });
@@ -1199,16 +1262,46 @@ export class Orchestrator {
     return { taskId, finalState: task.state, outcome: 'stop_requested', reportPath: null };
   }
 
-  /** Read the cooperative stop request, if any. */
+  /** Read the cooperative stop request: control.json, with legacy fallback. */
   private async readStopRequest(taskDir: string): Promise<{ reason: string } | null> {
-    const path = join(taskDir, 'stop-requested.json');
-    if (!(await fileExists(path))) return null;
-    try {
-      const raw = JSON.parse(await readText(path)) as { reason?: string };
-      return { reason: raw.reason || 'no reason given' };
-    } catch {
-      return { reason: 'no reason given (stop file unreadable)' };
+    for (const name of ['control.json', 'stop-requested.json']) {
+      const path = join(taskDir, name);
+      if (!(await fileExists(path))) continue;
+      try {
+        const raw = JSON.parse(await readText(path)) as { stopRequested?: boolean; reason?: string };
+        if (raw.stopRequested === false) continue;
+        return { reason: raw.reason || 'no reason given' };
+      } catch {
+        return { reason: 'no reason given (control file unreadable)' };
+      }
     }
+    return null;
+  }
+
+  /** Cancellation signal active transports poll for this task. */
+  private cancellationFor(taskDir: string): CancellationSignal {
+    return new FileCancellationSignal([
+      join(taskDir, 'control.json'),
+      join(taskDir, 'stop-requested.json'),
+    ]);
+  }
+
+  /** An active owned process was terminated mid-call; log it and stop honestly. */
+  private async finishCancelled(
+    taskId: string,
+    taskDir: string,
+    events: EventLogger,
+    phases: PhaseRecord[],
+    during: string,
+  ): Promise<RunOutcome> {
+    await events.log({
+      actor: 'kairo',
+      action: 'cancel_active_process',
+      status: 'completed',
+      message: `cancelled ${during} process`,
+    });
+    const reason = (await this.readStopRequest(taskDir))?.reason ?? 'no reason recorded';
+    return this.finishStopped(taskId, taskDir, events, phases, reason, during);
   }
 
   /** Honor a stop request: terminal `blocked` with outcome stopped_by_user, honest report. */
@@ -1218,6 +1311,7 @@ export class Orchestrator {
     events: EventLogger,
     phases: PhaseRecord[],
     reason: string,
+    cancelledDuring?: string,
   ): Promise<RunOutcome> {
     await events.log({ actor: 'kairo', action: 'stopped', status: 'completed', message: `stopped by user: ${reason}` });
     await this.setPending(taskId, null);
@@ -1235,6 +1329,7 @@ export class Orchestrator {
 
     const summary = [
       `Stopped by user: ${reason}`,
+      cancelledDuring ? `Cancellation happened during an active model call (${cancelledDuring}); the owned process was terminated.` : '',
       `Implementation phases run: ${phases.length}.`,
       `Working tree has task changes: ${treeDirty ? 'yes' : 'no'}.`,
       phases.length > 0 ? `Checks ran after the latest implementation: ${checksAfterImpl ? 'yes' : 'no'}.` : '',
@@ -1244,6 +1339,9 @@ export class Orchestrator {
     const extraRisks = hasWork
       ? ['high: task was stopped by the user before completion — any implementation changes are unreviewed/unverified']
       : [];
+    if (cancelledDuring && hasWork) {
+      extraRisks.push(`high: ${cancelledDuring} was cancelled mid-flight — changes may be partial`);
+    }
     const reportPath = await this.writeReport(taskId, taskDir, phases, summary, extraRisks, !hasWork);
     await events.log({ actor: 'kairo', action: 'report', status: 'completed', message: `report saved: ${reportPath}` });
     return { taskId, finalState: 'blocked', outcome: 'stopped_by_user', reportPath };
@@ -1283,6 +1381,25 @@ export class Orchestrator {
         managerNotes: await this.loadManagerNotes(taskDir),
       }),
     });
+    if (followup.result.cancelled) {
+      await events.log({
+        actor: 'kairo',
+        action: 'cancel_active_process',
+        status: 'completed',
+        message: 'cancelled head after-decision process',
+      });
+      // Synthetic directive — the loop-top stop boundary finalizes the stop
+      // before this directive would ever be acted on.
+      return {
+        actor: 'head',
+        action: 'stop_blocked',
+        requiresUserInput: false,
+        risk: 'medium',
+        reason: 'cancelled by user during the after-decision head call',
+        successCriteria: [],
+        checksToRun: [],
+      };
+    }
     if (!followup.parsed.ok || !followup.parsed.directive) {
       await writeText(join(taskDir, 'head-followup-raw.txt'), followup.parsed.rawOutput);
       await events.log({

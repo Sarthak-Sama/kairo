@@ -1,5 +1,6 @@
 import { execa, type Options as ExecaOptions } from 'execa';
 import { assertCommandSafe } from '../core/safety.js';
+import type { CancellationSignal } from '../core/cancellation.js';
 import { shellQuote } from '../utils/shell.js';
 
 export interface RunResult {
@@ -11,6 +12,8 @@ export interface RunResult {
   failed: boolean;
   timedOut: boolean;
   commandNotFound: boolean;
+  /** True when the run was terminated by a user cancellation signal. */
+  cancelled?: boolean;
 }
 
 export interface RunOptions {
@@ -20,6 +23,14 @@ export interface RunOptions {
   env?: Record<string, string>;
   /** Skip the destructive-pattern gate. Only for commands Kairo itself composed. */
   skipSafetyCheck?: boolean;
+  /**
+   * Polled while the child runs; when it fires, the OWNED child process is
+   * terminated and the result returns `cancelled: true` with whatever output
+   * was collected. Never searches or kills anything Kairo did not spawn.
+   */
+  cancellation?: CancellationSignal;
+  /** Cancellation poll interval; small in tests. */
+  cancellationPollMs?: number;
 }
 
 export interface ProcessRunner {
@@ -47,7 +58,54 @@ export class ExecaProcessRunner implements ProcessRunner {
       ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
       all: false,
     };
-    const result = await execa(command, execaOptions);
+    // When cancellable, run the child as its own process GROUP leader so a
+    // cancellation can terminate the shell AND its descendants (a killed
+    // shell otherwise leaves grandchildren holding the stdio pipes, hanging
+    // the await). This is still strictly Kairo-owned: only the group Kairo
+    // itself spawned is signalled — never a name search, never global.
+    const child = execa(command, {
+      ...execaOptions,
+      ...(options.cancellation ? { detached: true } : {}),
+    });
+
+    // Cancellation polling: terminate the OWNED child when the signal fires.
+    let cancelled = false;
+    let pollTimer: NodeJS.Timeout | undefined;
+    const killOwnedTree = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal); // our own group
+        else child.kill(signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          // already dead — nothing to do
+        }
+      }
+    };
+    if (options.cancellation) {
+      const pollMs = options.cancellationPollMs ?? 300;
+      const poll = async () => {
+        try {
+          if (await options.cancellation!.isCancellationRequested()) {
+            cancelled = true;
+            killOwnedTree('SIGTERM');
+            // escalate if something ignores SIGTERM
+            setTimeout(() => {
+              if (cancelled) killOwnedTree('SIGKILL');
+            }, 2000).unref();
+            return;
+          }
+        } catch {
+          // a broken signal must never crash the run
+        }
+        pollTimer = setTimeout(poll, pollMs);
+      };
+      pollTimer = setTimeout(poll, pollMs);
+    }
+
+    const result = await child;
+    if (pollTimer) clearTimeout(pollTimer);
     const stderr = typeof result.stderr === 'string' ? result.stderr : '';
     return {
       command,
@@ -58,6 +116,7 @@ export class ExecaProcessRunner implements ProcessRunner {
       failed: result.failed ?? false,
       timedOut: result.timedOut ?? false,
       commandNotFound: detectCommandNotFound(result.exitCode ?? null, stderr),
+      ...(cancelled ? { cancelled: true } : {}),
     };
   }
 

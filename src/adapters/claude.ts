@@ -9,6 +9,8 @@ export interface ClaudeInvocation {
   onChunk?: (chunk: string) => void;
   /** Per-call permission mode (e.g. "plan" for head-role calls); defaults to config. */
   permissionModeOverride?: string;
+  /** Fired by `kairo stop`: the owned child process is terminated. */
+  cancellation?: import('../core/cancellation.js').CancellationSignal;
 }
 
 export interface ClaudeResult {
@@ -17,6 +19,8 @@ export interface ClaudeResult {
   exitCode: number | null;
   durationMs: number;
   error?: string;
+  /** True when the invocation was terminated by a user cancellation. */
+  cancelled?: boolean;
 }
 
 export interface ClaudeAdapter {
@@ -66,12 +70,25 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       timeoutMs: 30 * 60 * 1000,
       // Composed by Kairo from config + fixed flags; Claude has its own permission system.
       skipSafetyCheck: true,
+      ...(invocation.cancellation ? { cancellation: invocation.cancellation } : {}),
     });
 
     const transcript = [run.stdout, run.stderr ? `\n--- stderr ---\n${run.stderr}` : '']
       .join('')
       .trim();
     invocation.onChunk?.(transcript);
+
+    if (run.cancelled) {
+      const reason = (await invocation.cancellation?.reason()) ?? 'no reason recorded';
+      return {
+        ok: false,
+        cancelled: true,
+        transcript, // partial output collected before termination
+        exitCode: run.exitCode,
+        durationMs: run.durationMs,
+        error: `cancelled by user: ${reason}`,
+      };
+    }
 
     const ok = run.exitCode === 0;
     return {

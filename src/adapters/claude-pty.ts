@@ -57,6 +57,7 @@ export class ClaudePtyAdapter implements ClaudeAdapter {
     private readonly repoRoot: string,
     private readonly ptyLoader: PtyLoader = defaultPtyLoader,
     private readonly timeoutMs: number = 30 * 60 * 1000,
+    private readonly cancellationPollMs: number = 300,
   ) {}
 
   async isAvailable(): Promise<boolean> {
@@ -101,10 +102,12 @@ export class ClaudePtyAdapter implements ClaudeAdapter {
       let transcript = '';
       let settled = false;
       let proc: PtyProcess | undefined;
+      let cancelTimer: NodeJS.Timeout | undefined;
       const settle = (result: ClaudeResult) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (cancelTimer) clearTimeout(cancelTimer);
         resolve(result);
       };
 
@@ -161,6 +164,37 @@ export class ClaudePtyAdapter implements ClaudeAdapter {
           ...(exitCode === 0 ? {} : { error: `Claude (pty) exited ${exitCode}` }),
         });
       });
+
+      // Cancellation polling: kill the OWNED PTY process when `kairo stop`
+      // fires; the transcript collected so far is preserved.
+      if (invocation.cancellation) {
+        const signal = invocation.cancellation;
+        const poll = async () => {
+          if (settled) return;
+          try {
+            if (await signal.isCancellationRequested()) {
+              try {
+                proc?.kill();
+              } catch {
+                // already dead — nothing to do
+              }
+              settle({
+                ok: false,
+                cancelled: true,
+                transcript,
+                exitCode: null,
+                durationMs: Date.now() - started,
+                error: `cancelled by user: ${(await signal.reason()) ?? 'no reason recorded'}`,
+              });
+              return;
+            }
+          } catch {
+            // a broken signal must never crash the invocation
+          }
+          cancelTimer = setTimeout(poll, this.cancellationPollMs);
+        };
+        cancelTimer = setTimeout(poll, this.cancellationPollMs);
+      }
 
       // Nothing is written to the PTY: the prompt travels via argv (see
       // class docs). Stdin stays untouched, so there is no prompt echo and
