@@ -62,6 +62,30 @@ ${checkNames}
 ${DIRECTIVE_CONTRACT}`;
 }
 
+/** Bound for the user-decisions section included in model prompts. */
+export const USER_DECISIONS_CHAR_LIMIT = 10_000;
+
+/**
+ * Render the binding-decisions section (dogfood fix: the stateless reviewer
+ * re-asked questions the user had already answered because decisions never
+ * reached its context). Tail-biased truncation — recent decisions win.
+ */
+export function renderUserDecisionsSection(userDecisions: string): string {
+  const trimmed = userDecisions.trim();
+  if (!trimmed) return '';
+  const bounded =
+    trimmed.length <= USER_DECISIONS_CHAR_LIMIT
+      ? trimmed
+      : `(earlier decisions truncated)\n…${trimmed.slice(-USER_DECISIONS_CHAR_LIMIT)}`;
+  return `## User Decisions Already Made
+
+These are binding product/business decisions for this task. Do not ask the same question again unless the implementation introduces a genuinely new ambiguity.
+
+${bounded}
+
+`;
+}
+
 export function buildReviewPrompt(input: {
   taskTitle: string;
   phase: number;
@@ -72,6 +96,7 @@ export function buildReviewPrompt(input: {
   revisionCount: number;
   maxRevisions: number;
   configuredCheckNames: string[];
+  userDecisions?: string;
 }): string {
   const checksSummary = input.checksRun
     ? input.checksRun.results
@@ -90,7 +115,7 @@ Phase ${input.phase} (revision ${input.revisionCount} of max ${input.maxRevision
 ## Master plan
 ${input.masterPlan || '(no master plan recorded)'}
 
-## Implementer report (Claude Code)
+${renderUserDecisionsSection(input.userDecisions ?? '')}## Implementer report (Claude Code)
 ${input.claudeReport || '(no report)'}
 
 ## Check results
@@ -123,6 +148,7 @@ export function buildClaudePrompt(input: {
   masterPlan: string;
   isRevision: boolean;
   previousReport?: string;
+  userDecisions?: string;
 }): string {
   const criteria =
     input.successCriteria.length > 0
@@ -138,7 +164,8 @@ ${input.taskTitle}
 
 ## Master plan (from the reviewer)
 ${input.masterPlan || '(no plan — single phase task)'}
-${revisionBlock}
+
+${renderUserDecisionsSection(input.userDecisions ?? '')}${revisionBlock}
 ## Phase ${input.phase} instructions
 ${input.instructions}
 
@@ -196,6 +223,7 @@ export function buildAfterUserDecisionPrompt(input: {
   phaseContext: string;
   question: string;
   answer: string;
+  userDecisions?: string;
 }): string {
   return `You previously asked the user a question while working on the task below.
 
@@ -205,7 +233,7 @@ ${input.taskTitle}
 ## Master plan
 ${input.masterPlan}
 
-## Work completed so far
+${renderUserDecisionsSection(input.userDecisions ?? '')}## Work completed so far
 ${input.phaseContext}
 
 ## Your question

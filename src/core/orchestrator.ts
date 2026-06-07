@@ -698,6 +698,7 @@ export class Orchestrator {
         revisionCount,
         maxRevisions: this.deps.config.limits.maxRevisionLoopsPerPhase,
         configuredCheckNames: this.deps.config.checks.map((c) => c.name),
+        userDecisions: await this.loadUserDecisions(taskDir),
       }),
     });
 
@@ -834,6 +835,7 @@ export class Orchestrator {
         successCriteria: directive.successCriteria,
         masterPlan,
         isRevision,
+        userDecisions: await this.loadUserDecisions(taskDir),
         ...(previous?.claudeReport ? { previousReport: previous.claudeReport } : {}),
       });
       await writeText(join(phaseDir, 'claude-prompt.md'), prompt);
@@ -1082,6 +1084,12 @@ export class Orchestrator {
     return (await fileExists(path)) ? await readText(path) : '(master plan artifact missing)';
   }
 
+  /** Binding user decisions for prompt context; empty string when none exist. */
+  private async loadUserDecisions(taskDir: string): Promise<string> {
+    const path = join(taskDir, 'user-decisions.md');
+    return (await fileExists(path)) ? await readText(path) : '';
+  }
+
   private async reinvokeCodexAfterUser(
     taskId: string,
     taskDir: string,
@@ -1112,6 +1120,7 @@ export class Orchestrator {
         phaseContext,
         question: directive.question ?? directive.reason,
         answer,
+        userDecisions: await this.loadUserDecisions(taskDir),
       }),
     });
     if (!followup.parsed.ok || !followup.parsed.directive) {

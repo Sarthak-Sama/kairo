@@ -3,9 +3,12 @@ import {
   buildAfterUserDecisionPrompt,
   buildDirectiveRetryPrompt,
   buildPlanFeedbackPrompt,
+  buildReviewPrompt,
   buildSelfEditPrompt,
   buildTriagePrompt,
   DIRECTIVE_CONTRACT,
+  renderUserDecisionsSection,
+  USER_DECISIONS_CHAR_LIMIT,
 } from '../../src/core/prompts.js';
 import { DEFAULT_CONFIG } from '../../src/core/config.js';
 
@@ -71,6 +74,48 @@ describe('directive contract centralization (dogfood fix 2)', () => {
     expect(prompt).toContain('"action":"delegate_to_claude"');
     expect(prompt).toContain(DIRECTIVE_CONTRACT);
     expect(prompt).toContain('exactly one valid directive JSON object');
+  });
+});
+
+describe('user decisions section (decision-amnesia fix)', () => {
+  it('renders nothing for empty decisions', () => {
+    expect(renderUserDecisionsSection('')).toBe('');
+    expect(renderUserDecisionsSection('   \n')).toBe('');
+  });
+
+  it('labels decisions as binding and includes the content', () => {
+    const section = renderUserDecisionsSection('**Q:** Modal or sidebar?\n**A:** Modal.');
+    expect(section).toContain('## User Decisions Already Made');
+    expect(section).toContain('binding product/business decisions');
+    expect(section).toContain('Modal.');
+  });
+
+  it('truncates oversized decisions tail-biased (recent decisions win)', () => {
+    const old = 'OLD-DECISION '.repeat(2000); // > limit
+    const recent = 'RECENT-FINAL-DECISION';
+    const section = renderUserDecisionsSection(old + recent);
+    expect(section.length).toBeLessThan(USER_DECISIONS_CHAR_LIMIT + 500);
+    expect(section).toContain('RECENT-FINAL-DECISION');
+    expect(section).toContain('(earlier decisions truncated)');
+  });
+
+  it('review prompt embeds the decisions section when provided, omits it when absent', () => {
+    const base = {
+      taskTitle: 'T',
+      phase: 1,
+      masterPlan: 'P',
+      claudeReport: 'R',
+      diffPatch: '',
+      checksRun: null,
+      revisionCount: 0,
+      maxRevisions: 3,
+      configuredCheckNames: ['test'],
+    };
+    const withDecisions = buildReviewPrompt({ ...base, userDecisions: '**A (user):** keep it interest-only' });
+    expect(withDecisions).toContain('## User Decisions Already Made');
+    expect(withDecisions).toContain('interest-only');
+    const without = buildReviewPrompt(base);
+    expect(without).not.toContain('## User Decisions Already Made');
   });
 });
 

@@ -2,6 +2,9 @@ import { join, relative } from 'node:path';
 import { readdir, stat } from 'node:fs/promises';
 import { loadConfig } from '../core/config.js';
 import { TaskStore } from '../core/task-store.js';
+import { readEventLog } from '../core/events.js';
+import { formatEventLine } from '../renderers/timeline.js';
+import { fileExists } from '../utils/fs.js';
 
 export async function inspectCommand(repoRoot: string, taskIdPartial: string): Promise<void> {
   const config = await loadConfig(repoRoot);
@@ -38,6 +41,31 @@ export async function inspectCommand(repoRoot: string, taskIdPartial: string): P
   console.log('\n  state history:');
   for (const entry of task.stateHistory) {
     console.log(`    ${entry.at}  ${entry.state}`);
+  }
+
+  // Latest activity: what the agency did most recently.
+  const { events } = await readEventLog(join(taskDir, 'agency-log.ndjson'));
+  if (events.length > 0) {
+    console.log(`\n  recent events (last ${Math.min(10, events.length)} of ${events.length}):`);
+    for (const event of events.slice(-10)) {
+      console.log('    ' + formatEventLine(event));
+    }
+  }
+
+  // Quick paths: where to look right now.
+  const keyPaths: Array<[string, string]> = [];
+  const reportPath = join(taskDir, 'report.md');
+  if (await fileExists(reportPath)) keyPaths.push(['report', reportPath]);
+  const phase = Math.max(task.currentPhase, 1);
+  const transcriptPath = join(store.phaseDir(taskId, phase), 'claude-transcript.log');
+  if (await fileExists(transcriptPath)) keyPaths.push(['claude transcript', transcriptPath]);
+  const planPath = join(taskDir, 'master-plan.md');
+  if (await fileExists(planPath)) keyPaths.push(['master plan', planPath]);
+  if (keyPaths.length > 0) {
+    console.log('\n  key artifacts:');
+    for (const [label, path] of keyPaths) {
+      console.log(`    ${label.padEnd(18)} ${path}`);
+    }
   }
 
   console.log('\n  artifacts:');

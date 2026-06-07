@@ -67,8 +67,11 @@ program
 program
   .command('logs')
   .argument('<task-id>', 'task id (or unique fragment)')
+  .option('-f, --follow', 'tail the log until the task is terminal or waiting on you')
   .description('Show the agency event log for a task')
-  .action((taskId: string) => wrap(() => logsCommand(repoRoot, taskId))());
+  .action((taskId: string, options: { follow?: boolean }) =>
+    wrap(() => logsCommand(repoRoot, taskId, options))(),
+  );
 
 program
   .command('inspect')

@@ -50,6 +50,60 @@ export class EventLogger {
   }
 }
 
+export interface FollowOptions {
+  /** Poll interval; small in tests, ~500ms for the CLI. */
+  pollIntervalMs?: number;
+  /**
+   * Checked after each poll; returning true performs one final read and
+   * stops. Used to stop when the task reaches a terminal/paused state.
+   */
+  isDone?: () => boolean | Promise<boolean>;
+}
+
+/**
+ * Tail an NDJSON event log: emit events already present, then poll for
+ * appended lines until `isDone` reports true. Byte-offset based — lines are
+ * never re-emitted. Resolves with the number of events delivered.
+ */
+export async function followEventLog(
+  logPath: string,
+  listener: EventListener,
+  options: FollowOptions = {},
+): Promise<number> {
+  const pollIntervalMs = options.pollIntervalMs ?? 500;
+  let offset = 0;
+  let carry = '';
+  let delivered = 0;
+
+  const drain = async (): Promise<void> => {
+    if (!(await fileExists(logPath))) return;
+    const raw = await readText(logPath);
+    if (raw.length <= offset) return;
+    const fresh = carry + raw.slice(offset);
+    offset = raw.length;
+    const lines = fresh.split('\n');
+    carry = lines.pop() ?? ''; // hold a trailing partial line for the next poll
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        listener(AgencyEventSchema.parse(JSON.parse(line)));
+        delivered++;
+      } catch {
+        // malformed line — skip here; readEventLog surfaces these on demand
+      }
+    }
+  };
+
+  for (;;) {
+    await drain();
+    if (await options.isDone?.()) {
+      await drain(); // final read so nothing written during the check is lost
+      return delivered;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+}
+
 /** Read all events back from an NDJSON log. Malformed lines are surfaced, not dropped silently. */
 export async function readEventLog(
   logPath: string,

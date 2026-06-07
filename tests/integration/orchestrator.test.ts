@@ -434,6 +434,39 @@ describe('orchestrator (mocked adapters)', () => {
     expect(decisions).toContain('Use a modal, not a sidebar.');
   });
 
+  it('decision-amnesia regression: review and implementation context include prior user decisions', async () => {
+    // Live dogfood finding (2/2 runs): the stateless reviewer re-asked an
+    // already-answered product question because user decisions never reached
+    // its prompt. They must now.
+    userAnswers = ['Use a modal, not a sidebar.'];
+    planAnswers = ['y'];
+    codex.enqueueDirective(
+      { action: 'ask_user', question: 'Modal or sidebar?', reason: 'product decision' },
+      'Plan pending decision.',
+    );
+    codex.enqueueDirective(
+      { action: 'delegate_to_claude', phase: 1, instructions: 'Build a modal.' },
+      'Proceeding with modal.',
+    );
+    claude.enqueueReport(1);
+    codex.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+    statusAfterBaseline(' M src/modal.tsx');
+
+    const outcome = await makeOrchestrator().run('Build shortcut helper UI');
+
+    expect(outcome.outcome).toBe('completed');
+    const reviewPrompt = codex.invocations.find((i) => i.purpose === 'review-phase-1')?.prompt ?? '';
+    expect(reviewPrompt).toContain('## User Decisions Already Made');
+    expect(reviewPrompt).toContain('Do not ask the same question again');
+    expect(reviewPrompt).toContain('Modal or sidebar?');
+    expect(reviewPrompt).toContain('Use a modal, not a sidebar.');
+    // The implementer also gets the binding decisions.
+    expect(claude.invocations[0]?.prompt).toContain('Use a modal, not a sidebar.');
+    // The after-decision Codex call carries earlier decisions too.
+    const afterUserPrompt = codex.invocations.find((i) => i.purpose === 'after-user-decision')?.prompt ?? '';
+    expect(afterUserPrompt).toContain('## User Decisions Already Made');
+  });
+
   it('ask_user with no interactive channel: pauses as awaiting_user_decision', async () => {
     userAnswers = []; // askUser returns null
     codex.enqueueDirective(
