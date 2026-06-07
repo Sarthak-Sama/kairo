@@ -198,6 +198,12 @@ export class Orchestrator {
     // are canonical; the NDJSON log stays audit-only).
     const phases = await reconstructPhases(taskDir);
 
+    // A stop requested while the task was pausing wins over the resume.
+    const lingeringStop = await this.readStopRequest(taskDir);
+    if (lingeringStop) {
+      return this.finishStopped(taskId, taskDir, events, phases, lingeringStop.reason);
+    }
+
     // Dirty-tree rules on resume: before any implementation the tree must
     // still be clean; after implementation, Kairo's own prior changes are
     // expected — allow, but record the risk. Never stash/clean/commit.
@@ -406,6 +412,12 @@ export class Orchestrator {
     let iterations = 0;
 
     for (;;) {
+      // Safe boundary: honor a cooperative stop before approval, before
+      // implementation, before continuing phases, and between review cycles.
+      const stop = await this.readStopRequest(taskDir);
+      if (stop) {
+        return this.finishStopped(taskId, taskDir, events, phases, stop.reason);
+      }
       if (++iterations > maxIterations) {
         return this.finishBlocked(taskId, taskDir, events, phases, `loop iteration guard tripped (${maxIterations} iterations)`);
       }
@@ -471,6 +483,14 @@ export class Orchestrator {
             return this.finishFailed(taskId, taskDir, events, phases, implemented.error);
           }
           const record = implemented.record;
+
+          // Safe boundary: honor a stop that arrived during implementation —
+          // the phase record is preserved; review/checks are honestly skipped.
+          const stopAfterImpl = await this.readStopRequest(taskDir);
+          if (stopAfterImpl) {
+            const phasesWithRecord = phases.filter((p) => p.phase !== phase).concat(record);
+            return this.finishStopped(taskId, taskDir, events, phasesWithRecord, stopAfterImpl.reason);
+          }
 
           // Review the implementation.
           const phasesWithRecord = phases.filter((p) => p.phase !== phase).concat(record);
@@ -699,6 +719,7 @@ export class Orchestrator {
         maxRevisions: this.deps.config.limits.maxRevisionLoopsPerPhase,
         configuredCheckNames: this.deps.config.checks.map((c) => c.name),
         userDecisions: await this.loadUserDecisions(taskDir),
+        managerNotes: await this.loadManagerNotes(taskDir),
       }),
     });
 
@@ -836,6 +857,7 @@ export class Orchestrator {
         masterPlan,
         isRevision,
         userDecisions: await this.loadUserDecisions(taskDir),
+        managerNotes: await this.loadManagerNotes(taskDir),
         ...(previous?.claudeReport ? { previousReport: previous.claudeReport } : {}),
       });
       await writeText(join(phaseDir, 'claude-prompt.md'), prompt);
@@ -933,6 +955,26 @@ export class Orchestrator {
         message: 'codex self-edit session produced no working-tree changes',
       });
       return { error: 'Codex self-edit session produced no working-tree changes' };
+    }
+
+    // Safe boundary: a stop requested mid-implementation skips checks; the
+    // post-implementation boundary in the loop finalizes the stop honestly
+    // (the report will show "checks ran after latest implementation: no").
+    if (await this.readStopRequest(this.store.taskDir(taskId)) !== null) {
+      await events.log({ actor: 'checks', action: 'run_checks', status: 'skipped', message: 'checks skipped — stop requested by user' });
+      return {
+        record: {
+          phase,
+          claudeReport,
+          checksRun: null,
+          changedFiles: diff.changedFiles,
+          review: '',
+          directiveRisk: directive.risk,
+          reviewRisk: null,
+          diffAvailable: diff.available,
+          ...(diff.note !== undefined ? { diffNote: diff.note } : {}),
+        },
+      };
     }
 
     // Run checks
@@ -1090,6 +1132,100 @@ export class Orchestrator {
     return (await fileExists(path)) ? await readText(path) : '';
   }
 
+  /** Supervision notes left via `kairo note`; empty string when none exist. */
+  private async loadManagerNotes(taskDir: string): Promise<string> {
+    const path = join(taskDir, 'manager-notes.md');
+    return (await fileExists(path)) ? await readText(path) : '';
+  }
+
+  /**
+   * Stop a task on the user's behalf.
+   *
+   * Paused tasks finalize immediately. Active tasks get a cooperative stop:
+   * a flag file the running loop honors at its next safe boundary — Kairo
+   * never kills processes it does not own, and the `stop` CLI process must
+   * not rewrite task.json while a runner may be mid-write (hence the file).
+   */
+  async stop(taskIdPartial: string, reason: string): Promise<RunOutcome> {
+    const taskId = await this.store.resolveTaskId(taskIdPartial);
+    const task = await this.store.getTask(taskId);
+    const taskDir = this.store.taskDir(taskId);
+
+    if (isTerminalState(task.state)) {
+      throw new Error(`task ${taskId} is already ${task.state} — terminal tasks cannot be stopped`);
+    }
+
+    const events = new EventLogger(join(taskDir, 'agency-log.ndjson'), this.clock);
+    if (this.deps.onEvent) events.onEvent(this.deps.onEvent);
+    await events.log({ actor: 'user', action: 'stop_requested', status: 'completed', message: `stop requested: ${reason}` });
+    await writeJson(join(taskDir, 'stop-requested.json'), {
+      reason,
+      requestedAt: this.clock().toISOString(),
+    });
+
+    const paused = task.state === 'awaiting_plan_approval' || task.state === 'awaiting_user_decision';
+    if (paused) {
+      // No runner is active while paused — safe to finalize right here.
+      const phases = await reconstructPhases(taskDir);
+      return this.finishStopped(taskId, taskDir, events, phases, reason);
+    }
+
+    // Active (or crashed) task: cooperative stop only. The running loop will
+    // honor the flag at its next safe boundary; if no runner is alive, the
+    // flag persists and any future resume attempt honors it immediately.
+    return { taskId, finalState: task.state, outcome: 'stop_requested', reportPath: null };
+  }
+
+  /** Read the cooperative stop request, if any. */
+  private async readStopRequest(taskDir: string): Promise<{ reason: string } | null> {
+    const path = join(taskDir, 'stop-requested.json');
+    if (!(await fileExists(path))) return null;
+    try {
+      const raw = JSON.parse(await readText(path)) as { reason?: string };
+      return { reason: raw.reason || 'no reason given' };
+    } catch {
+      return { reason: 'no reason given (stop file unreadable)' };
+    }
+  }
+
+  /** Honor a stop request: terminal `blocked` with outcome stopped_by_user, honest report. */
+  private async finishStopped(
+    taskId: string,
+    taskDir: string,
+    events: EventLogger,
+    phases: PhaseRecord[],
+    reason: string,
+  ): Promise<RunOutcome> {
+    await events.log({ actor: 'kairo', action: 'stopped', status: 'completed', message: `stopped by user: ${reason}` });
+    await this.setPending(taskId, null);
+    await this.store.transition(taskId, 'blocked');
+    await this.setOutcome(taskId, 'stopped_by_user');
+
+    const status = await this.deps.runner.runShell('git status --porcelain', {
+      cwd: this.deps.repoRoot,
+      skipSafetyCheck: true,
+    });
+    const treeDirty = status.exitCode === 0 && status.stdout.trim().length > 0;
+    const lastPhase = phases[phases.length - 1];
+    const checksAfterImpl = lastPhase ? lastPhase.checksRun !== null : false;
+    const hasWork = phases.length > 0 || treeDirty;
+
+    const summary = [
+      `Stopped by user: ${reason}`,
+      `Implementation phases run: ${phases.length}.`,
+      `Working tree has task changes: ${treeDirty ? 'yes' : 'no'}.`,
+      phases.length > 0 ? `Checks ran after the latest implementation: ${checksAfterImpl ? 'yes' : 'no'}.` : '',
+      hasWork ? '' : 'No implementation ran and the working tree is clean — nothing to commit; safe to discard.',
+    ].filter(Boolean).join('\n\n');
+
+    const extraRisks = hasWork
+      ? ['high: task was stopped by the user before completion — any implementation changes are unreviewed/unverified']
+      : [];
+    const reportPath = await this.writeReport(taskId, taskDir, phases, summary, extraRisks, !hasWork);
+    await events.log({ actor: 'kairo', action: 'report', status: 'completed', message: `report saved: ${reportPath}` });
+    return { taskId, finalState: 'blocked', outcome: 'stopped_by_user', reportPath };
+  }
+
   private async reinvokeCodexAfterUser(
     taskId: string,
     taskDir: string,
@@ -1121,6 +1257,7 @@ export class Orchestrator {
         question: directive.question ?? directive.reason,
         answer,
         userDecisions: await this.loadUserDecisions(taskDir),
+        managerNotes: await this.loadManagerNotes(taskDir),
       }),
     });
     if (!followup.parsed.ok || !followup.parsed.directive) {
@@ -1220,6 +1357,7 @@ export class Orchestrator {
     phases: PhaseRecord[],
     summary: string,
     extraRisks: string[] = [],
+    nothingToCommit = false,
   ): Promise<string> {
     const task = await this.store.getTask(taskId);
     const { events } = await readEventLog(join(taskDir, 'agency-log.ndjson'));
@@ -1292,6 +1430,7 @@ export class Orchestrator {
       risks,
       diffUnavailable,
       unrunCheckNames,
+      nothingToCommit,
       ...(baselineNote ? { baselineNote } : {}),
       scope: scope.slice(0, 4000),
       summary,

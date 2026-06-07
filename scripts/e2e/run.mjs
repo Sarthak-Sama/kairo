@@ -406,6 +406,39 @@ const SCENARIOS = {
     return { sandbox, stateDir };
   },
 
+  async stop_and_note(check) {
+    // Supervision control through the real CLI: note a paused task, stop it,
+    // verify the terminal state and that resume refuses.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox);
+    const env = makeEnv('plan_pause', stateDir);
+
+    const first = await runPlain(sandbox, env, 'Add a greeting feature');
+    check(first.code === 0, `run exits 0 while pausing (got ${first.code})`);
+
+    const id = taskId(sandbox);
+    const note = await runPlain(sandbox, env, ['note', id, 'Reviewed the plan; postponing this work.']);
+    check(note.code === 0, `note exits 0 (got ${note.code})`);
+    check(note.out.includes('notes do not answer it'), 'note explains it does not answer the pending question');
+    let task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.pending?.kind === 'plan_approval', 'note did not consume the pending checkpoint');
+
+    const stop = await runPlain(sandbox, env, ['stop', id, '--reason', 'Operator decided not to proceed.']);
+    check(stop.code === 0, `stop exits 0 (got ${stop.code})`);
+    task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.state === 'blocked' && task.outcome === 'stopped_by_user', `terminal stopped state (got ${task.state}/${task.outcome})`);
+    check(task.pending === null, 'pending cleared by stop');
+    const report = readArtifact(sandbox, 'report.md');
+    check(report.includes('Operator decided not to proceed.'), 'report carries the stop reason');
+    check(report.includes('no commit needed'), 'no-work stop says no commit needed');
+
+    const resume = await runPlain(sandbox, env, ['resume', id]);
+    check(resume.code === 1, `resume refuses stopped task (got ${resume.code})`);
+    check(resume.out.includes('terminal tasks cannot be resumed'), 'resume explains why');
+    return { sandbox, stateDir };
+  },
+
   async stop_blocked(check) {
     const sandbox = makeSandbox();
     const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));

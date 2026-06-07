@@ -86,6 +86,29 @@ ${bounded}
 `;
 }
 
+/** Bound for the manager-notes section included in model prompts. */
+export const MANAGER_NOTES_CHAR_LIMIT = 6_000;
+
+/**
+ * Supervision notes left via `kairo note` — context, not commands or answers.
+ * Tail-biased truncation; recent notes win.
+ */
+export function renderManagerNotesSection(notes: string): string {
+  const trimmed = notes.trim();
+  if (!trimmed) return '';
+  const bounded =
+    trimmed.length <= MANAGER_NOTES_CHAR_LIMIT
+      ? trimmed
+      : `(earlier notes truncated)\n…${trimmed.slice(-MANAGER_NOTES_CHAR_LIMIT)}`;
+  return `## Recent Manager Notes
+
+Supervision context from the user. These are NOT answers to pending questions and NOT new requirements unless they clarify scope — but respect explicit constraints stated here.
+
+${bounded}
+
+`;
+}
+
 export function buildReviewPrompt(input: {
   taskTitle: string;
   phase: number;
@@ -97,6 +120,7 @@ export function buildReviewPrompt(input: {
   maxRevisions: number;
   configuredCheckNames: string[];
   userDecisions?: string;
+  managerNotes?: string;
 }): string {
   const checksSummary = input.checksRun
     ? input.checksRun.results
@@ -115,7 +139,7 @@ Phase ${input.phase} (revision ${input.revisionCount} of max ${input.maxRevision
 ## Master plan
 ${input.masterPlan || '(no master plan recorded)'}
 
-${renderUserDecisionsSection(input.userDecisions ?? '')}## Implementer report (Claude Code)
+${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Implementer report (Claude Code)
 ${input.claudeReport || '(no report)'}
 
 ## Check results
@@ -149,6 +173,7 @@ export function buildClaudePrompt(input: {
   isRevision: boolean;
   previousReport?: string;
   userDecisions?: string;
+  managerNotes?: string;
 }): string {
   const criteria =
     input.successCriteria.length > 0
@@ -165,7 +190,7 @@ ${input.taskTitle}
 ## Master plan (from the reviewer)
 ${input.masterPlan || '(no plan — single phase task)'}
 
-${renderUserDecisionsSection(input.userDecisions ?? '')}${revisionBlock}
+${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}${revisionBlock}
 ## Phase ${input.phase} instructions
 ${input.instructions}
 
@@ -224,6 +249,7 @@ export function buildAfterUserDecisionPrompt(input: {
   question: string;
   answer: string;
   userDecisions?: string;
+  managerNotes?: string;
 }): string {
   return `You previously asked the user a question while working on the task below.
 
@@ -233,7 +259,7 @@ ${input.taskTitle}
 ## Master plan
 ${input.masterPlan}
 
-${renderUserDecisionsSection(input.userDecisions ?? '')}## Work completed so far
+${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Work completed so far
 ${input.phaseContext}
 
 ## Your question

@@ -20,6 +20,8 @@ export interface ReportInput {
   diffUnavailable?: boolean;
   /** Configured checks that never ran in any phase — listed, never implied passed. */
   unrunCheckNames?: string[];
+  /** True when the task made no changes at all (e.g. stopped before implementation). */
+  nothingToCommit?: boolean;
   /** One-line description of the git baseline (cleanliness, sha). */
   baselineNote?: string;
   scope: string;
@@ -47,7 +49,7 @@ export function decideCommitRecommendation(input: {
 }): CommitRecommendation {
   const failed = input.checkResults.some((r) => r.status === 'failed' || r.status === 'blocked');
   const skipped = input.checkResults.some((r) => r.status === 'skipped');
-  const badOutcome = ['failed', 'blocked', 'unsafe', 'interrupted'].includes(input.outcome);
+  const badOutcome = ['failed', 'blocked', 'unsafe', 'interrupted', 'stopped_by_user'].includes(input.outcome);
 
   if (failed || badOutcome || input.highRisk || input.reviewHasBlockers || input.diffUnavailable) {
     return 'not safe to commit';
@@ -162,7 +164,11 @@ export function generateReport(input: ReportInput): string {
   lines.push('');
   lines.push('## Commit Recommendation');
   lines.push('');
-  lines.push(`**${recommendation}**`);
+  if (input.nothingToCommit) {
+    lines.push('**no commit needed** — no implementation ran and the working tree has no task changes; safe to discard.');
+  } else {
+    lines.push(`**${recommendation}**`);
+  }
   lines.push('');
   return lines.join('\n');
 }

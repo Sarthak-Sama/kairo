@@ -4,7 +4,7 @@ import { loadConfig } from '../core/config.js';
 import { TaskStore } from '../core/task-store.js';
 import { readEventLog } from '../core/events.js';
 import { formatEventLine } from '../renderers/timeline.js';
-import { fileExists } from '../utils/fs.js';
+import { fileExists, readJson, readText } from '../utils/fs.js';
 
 export async function inspectCommand(repoRoot: string, taskIdPartial: string): Promise<void> {
   const config = await loadConfig(repoRoot);
@@ -26,6 +26,33 @@ export async function inspectCommand(repoRoot: string, taskIdPartial: string): P
       `  baseline:    ${task.baseline.isGitRepo ? `${task.baseline.branch}@${task.baseline.headSha?.slice(0, 8)}${task.baseline.dirty ? ' (dirty)' : ''}` : 'not a git repo'}`,
     );
   }
+  // Stopped tasks must be unmistakable.
+  const stopPath = join(taskDir, 'stop-requested.json');
+  if (await fileExists(stopPath)) {
+    try {
+      const stop = await readJson<{ reason?: string; requestedAt?: string }>(stopPath);
+      const honored = task.outcome === 'stopped_by_user';
+      console.log('\n  stop:');
+      console.log(`    ${honored ? 'STOPPED BY USER' : 'STOP REQUESTED (not yet honored — runner stops at next safe boundary)'}`);
+      console.log(`    reason: ${stop.reason ?? '(none given)'}`);
+      if (stop.requestedAt) console.log(`    at:     ${stop.requestedAt}`);
+    } catch {
+      console.log('\n  stop: requested (stop-requested.json unreadable)');
+    }
+  }
+
+  // Latest manager notes (supervision context, not answers).
+  const notesPath = join(taskDir, 'manager-notes.md');
+  if (await fileExists(notesPath)) {
+    const noteBlocks = (await readText(notesPath)).split(/^## /m).filter((b) => b.trim());
+    const latest = noteBlocks.slice(-3);
+    console.log(`\n  manager notes (last ${latest.length} of ${noteBlocks.length}):`);
+    for (const block of latest) {
+      const [stamp, ...body] = block.trim().split('\n');
+      console.log(`    ${stamp}  ${body.join(' ').trim().slice(0, 120)}`);
+    }
+  }
+
   if (task.pending) {
     console.log('\n  pending:');
     console.log(`    kind:      ${task.pending.kind}`);

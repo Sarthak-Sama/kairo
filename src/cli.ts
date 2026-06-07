@@ -9,6 +9,8 @@ import { checkCommand } from './commands/check.js';
 import { reportCommand } from './commands/report.js';
 import { resumeCommand } from './commands/resume.js';
 import { askCommand } from './commands/ask.js';
+import { stopCommand } from './commands/stop.js';
+import { noteCommand } from './commands/note.js';
 import { ConfigError } from './core/config.js';
 
 const program = new Command();
@@ -58,6 +60,22 @@ program
   .argument('<message>', 'answer/feedback for the pending decision')
   .description('Answer a paused task non-interactively (approval, feedback, or decision)')
   .action((taskId: string, message: string) => wrap(() => askCommand(repoRoot, taskId, message))());
+
+program
+  .command('stop')
+  .argument('<task-id>', 'task id (or unique fragment)')
+  .option('--reason <text>', 'why the task is being stopped', 'stopped by user')
+  .description('Stop a task: paused tasks finalize now; active runners stop at the next safe boundary')
+  .action((taskId: string, options: { reason: string }) =>
+    wrap(() => stopCommand(repoRoot, taskId, options.reason))(),
+  );
+
+program
+  .command('note')
+  .argument('<task-id>', 'task id (or unique fragment)')
+  .argument('<message>', 'supervision note (context for future model calls)')
+  .description('Leave a manager note on a task (does not answer pending questions)')
+  .action((taskId: string, message: string) => wrap(() => noteCommand(repoRoot, taskId, message))());
 
 program
   .command('status')
