@@ -73,6 +73,32 @@ describe('config', () => {
     expect(result.success).toBe(false);
   });
 
+  it('defaults roles to the original team (codex head, claude development lead)', () => {
+    const parsed = ConfigSchema.parse({ version: 1 });
+    expect(parsed.roles.head).toBe('codex');
+    expect(parsed.roles.developmentLead).toBe('claude');
+    expect(DEFAULT_CONFIG.roles).toEqual({ head: 'codex', developmentLead: 'claude' });
+  });
+
+  it('accepts all four role combinations', () => {
+    for (const head of ['codex', 'claude'] as const) {
+      for (const developmentLead of ['codex', 'claude'] as const) {
+        const parsed = ConfigSchema.parse({ version: 1, roles: { head, developmentLead } });
+        expect(parsed.roles).toEqual({ head, developmentLead });
+      }
+    }
+  });
+
+  it('rejects invalid role providers', () => {
+    expect(ConfigSchema.safeParse({ version: 1, roles: { head: 'gemini' } }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ version: 1, roles: { developmentLead: 'gpt' } }).success).toBe(false);
+  });
+
+  it('defaults claude.headPermissionMode to "plan"', () => {
+    expect(ConfigSchema.parse({ version: 1 }).claude.headPermissionMode).toBe('plan');
+    expect(DEFAULT_CONFIG.claude.headPermissionMode).toBe('plan');
+  });
+
   it('rejects checks with empty command', () => {
     const result = ConfigSchema.safeParse({
       version: 1,

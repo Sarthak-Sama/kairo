@@ -9,8 +9,8 @@ import { fileExists, readText, writeJson, writeText } from '../../src/utils/fs.j
 import {
   makeTempDir,
   cleanupDir,
-  MockCodexAdapter,
-  MockClaudeAdapter,
+  MockHeadAdapter,
+  MockDevLeadAdapter,
   MockProcessRunner,
 } from '../helpers/mocks.js';
 
@@ -35,16 +35,16 @@ describe('kairo ask audit honesty', () => {
 
   /** Pause a task at plan approval using mocked adapters; returns the task id. */
   async function pauseAtPlanApproval(): Promise<string> {
-    const codex = new MockCodexAdapter();
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build it.' },
+    const head = new MockHeadAdapter();
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build it.' },
       'Plan.',
     );
     const orchestrator = new Orchestrator({
       config: ConfigSchema.parse({ version: 1, checks: [] }),
       repoRoot,
-      codex,
-      claude: new MockClaudeAdapter(),
+      head,
+      developmentLead: new MockDevLeadAdapter(),
       runner: new MockProcessRunner(),
       askUser: async () => null,
       approvePlan: async () => null,
@@ -98,7 +98,7 @@ describe('kairo ask audit honesty', () => {
 
     const [line] = await readMessages(taskId);
     expect(line?.handled).toBe(false);
-    expect(line?.reason).toContain('Codex CLI');
+    expect(line?.reason).toContain('head agent');
     // Pending checkpoint untouched.
     const task = await new TaskStore(join(repoRoot, '.kairo')).getTask(taskId);
     expect(task.pending?.kind).toBe('plan_approval');

@@ -1,14 +1,30 @@
 import { z } from 'zod';
 import { appendText, fileExists, readText } from '../utils/fs.js';
 
-export const AgencyEventSchema = z.object({
-  timestamp: z.string(),
-  actor: z.enum(['kairo', 'codex', 'claude', 'user', 'checks']),
-  action: z.string().min(1),
-  status: z.enum(['started', 'completed', 'failed', 'skipped']),
-  message: z.string(),
-  metadata: z.record(z.unknown()).default({}),
-});
+/** Legacy logs used provider names as actors; normalize to roles on read. */
+const LEGACY_ACTOR_MAP: Record<string, string> = {
+  codex: 'head',
+  claude: 'development_lead',
+};
+
+export const AgencyEventSchema = z.preprocess(
+  (value) => {
+    if (typeof value !== 'object' || value === null) return value;
+    const obj = { ...(value as Record<string, unknown>) };
+    if (typeof obj.actor === 'string' && obj.actor in LEGACY_ACTOR_MAP) {
+      obj.actor = LEGACY_ACTOR_MAP[obj.actor];
+    }
+    return obj;
+  },
+  z.object({
+    timestamp: z.string(),
+    actor: z.enum(['kairo', 'head', 'development_lead', 'user', 'checks']),
+    action: z.string().min(1),
+    status: z.enum(['started', 'completed', 'failed', 'skipped']),
+    message: z.string(),
+    metadata: z.record(z.unknown()).default({}),
+  }),
+);
 
 export type AgencyEvent = z.infer<typeof AgencyEventSchema>;
 export type AgencyEventInput = Omit<AgencyEvent, 'timestamp' | 'metadata'> & {
@@ -27,13 +43,16 @@ export class EventLogger {
   constructor(
     private readonly logPath: string,
     private readonly clock: () => Date = () => new Date(),
+    /** Optional input decorator, e.g. stamping provider metadata per actor. */
+    private readonly decorate?: (input: AgencyEventInput) => AgencyEventInput,
   ) {}
 
   onEvent(listener: EventListener): void {
     this.listeners.push(listener);
   }
 
-  async log(input: AgencyEventInput): Promise<AgencyEvent> {
+  async log(rawInput: AgencyEventInput): Promise<AgencyEvent> {
+    const input = this.decorate ? this.decorate(rawInput) : rawInput;
     const event: AgencyEvent = {
       timestamp: this.clock().toISOString(),
       actor: input.actor,

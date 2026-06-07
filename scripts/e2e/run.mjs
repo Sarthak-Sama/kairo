@@ -77,7 +77,7 @@ console.log('check ok');
   return dir;
 }
 
-function initKairo(sandbox, { claudeCommand = 'claude', codexCommand = 'codex', claudeTransport = 'print' } = {}) {
+function initKairo(sandbox, { claudeCommand = 'claude', codexCommand = 'codex', claudeTransport = 'print', roles = null } = {}) {
   execSync(`node ${JSON.stringify(CLI)} init`, { cwd: sandbox });
   const configPath = join(sandbox, '.kairo', 'config.json');
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
@@ -85,6 +85,7 @@ function initKairo(sandbox, { claudeCommand = 'claude', codexCommand = 'codex', 
   config.claude.command = claudeCommand;
   config.claude.transport = claudeTransport;
   config.codex.command = codexCommand;
+  if (roles) config.roles = roles;
   writeFileSync(configPath, JSON.stringify(config, null, 2));
 }
 
@@ -220,8 +221,8 @@ const SCENARIOS = {
     initKairo(sandbox, { codexCommand: 'definitely-missing-codex-xyz' });
     const { code, out } = await runPlain(sandbox, makeEnv('happy_delegation', stateDir, { stubsOnPath: false }), 'Build something');
     check(code === 1, `exit code 1 (got ${code})`);
-    check(out.includes('Codex CLI'), 'error names the Codex CLI');
-    check(out.includes('codex.command'), 'error points at codex.command config');
+    check(out.includes('head agent "codex"'), 'error names the head agent and provider');
+    check(out.includes('definitely-missing-codex-xyz'), 'error shows the configured command');
     return { sandbox, stateDir, expectTask: false, nonGitInvariantOnly: false };
   },
 
@@ -238,15 +239,15 @@ const SCENARIOS = {
     check(task.state === 'reported' && task.outcome === 'completed', `task reported/completed (got ${task.state}/${task.outcome})`);
     for (const artifact of [
       'repo-scan.md', 'master-plan.md', 'report.md',
-      'phase-001/codex-directive.json', 'phase-001/claude-prompt.md', 'phase-001/claude-transcript.log',
-      'phase-001/claude-report.md', 'phase-001/diff.patch', 'phase-001/checks.json', 'phase-001/checks.log',
-      'phase-001/codex-review.md', 'phase-001/codex-decision.json',
+      'phase-001/head-directive.json', 'phase-001/development-lead-prompt.md', 'phase-001/development-lead-transcript.log',
+      'phase-001/development-lead-report.md', 'phase-001/diff.patch', 'phase-001/checks.json', 'phase-001/checks.log',
+      'phase-001/head-review.md', 'phase-001/head-decision.json',
     ]) check(has(sandbox, artifact), `artifact ${artifact}`);
     check(readArtifact(sandbox, 'phase-001/diff.patch').includes('feature.txt'), 'diff contains the real edit');
     const report = readArtifact(sandbox, 'report.md');
     check(report.includes('**safe to commit**'), 'report safe to commit');
     check(report.includes('clean working tree'), 'report notes clean baseline');
-    check(out.includes('[claude]'), 'timeline shows claude activity');
+    check(out.includes('[development:claude]'), 'timeline shows provider-labelled development activity');
     const sandboxes = readCodexLog(stateDir).map((e) => `${e.promptType}:${e.sandbox}`);
     check(JSON.stringify(sandboxes) === JSON.stringify(['triage:read-only', 'review:read-only']), `codex sandboxes ${sandboxes}`);
     return { sandbox, stateDir };
@@ -260,8 +261,8 @@ const SCENARIOS = {
     const { code } = await runPlain(sandbox, makeEnv('self_edit', stateDir), 'Append changelog line');
     check(code === 0, `exit code 0 (got ${code})`);
     check(readTask(sandbox).outcome === 'completed', 'completed');
-    check(has(sandbox, 'phase-001/codex-self-edit-prompt.md'), 'self-edit prompt artifact');
-    check(has(sandbox, 'phase-001/codex-self-edit-transcript.md'), 'self-edit transcript artifact');
+    check(has(sandbox, 'phase-001/head-self-edit-prompt.md'), 'self-edit prompt artifact');
+    check(has(sandbox, 'phase-001/head-self-edit-transcript.md'), 'self-edit transcript artifact');
     check(readArtifact(sandbox, 'phase-001/diff.patch').includes('changelog'), 'diff shows the self-edit');
     const sandboxes = readCodexLog(stateDir).map((e) => `${e.promptType}:${e.sandbox}`);
     check(
@@ -269,6 +270,46 @@ const SCENARIOS = {
       `sandbox discipline (got ${sandboxes})`,
     );
     check(!existsSync(join(stateDir, 'claude-log.ndjson')), 'claude never invoked');
+    return { sandbox, stateDir };
+  },
+
+  async claude_head_team(check) {
+    // Role-selectable team: Claude as head AND development lead. Codex is
+    // deliberately absent (missing command) — the run must not need it.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox, {
+      codexCommand: 'definitely-missing-codex-xyz',
+      roles: { head: 'claude', developmentLead: 'claude' },
+    });
+    const env = makeEnv('happy_delegation', stateDir);
+
+    const first = await runPlain(sandbox, env, 'Add a greeting feature');
+    check(first.code === 0, `run exits 0 while pausing (got ${first.code})`);
+    let task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.state === 'awaiting_plan_approval', `paused at gate (got ${task.state})`);
+
+    const second = await runPlain(sandbox, env, ['ask', taskId(sandbox), 'y']);
+    check(second.code === 0, `ask exits 0 (got ${second.code})`);
+    task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.state === 'reported' && task.outcome === 'completed', `completed (got ${task.state}/${task.outcome})`);
+
+    // Codex was never touched; every call went to the claude stub.
+    check(!existsSync(join(stateDir, 'codex-log.ndjson')), 'zero codex invocations');
+    const claudeLog = readFileSync(join(stateDir, 'claude-log.ndjson'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const roles = claudeLog.map((e) => e.role);
+    check(roles.includes('head-triage') && roles.includes('head-review') && roles.includes('development'),
+      `claude served all roles (got ${roles.join(',')})`);
+    // Head calls use headPermissionMode "plan"; development uses acceptEdits.
+    const headCall = claudeLog.find((e) => e.role === 'head-triage');
+    const devCall = claudeLog.find((e) => e.role === 'development');
+    check(headCall.argv.join(' ').includes('--permission-mode plan'), `head used plan mode (${headCall.argv.join(' ')})`);
+    check(devCall.argv.join(' ').includes('--permission-mode acceptEdits'), 'development used acceptEdits');
+    // Role-neutral artifacts and provider-labelled timeline.
+    check(has(sandbox, 'phase-001/head-review.md'), 'head-review.md written');
+    check(has(sandbox, 'phase-001/development-lead-report.md'), 'development-lead-report.md written');
+    check(second.out.includes('[head:claude]'), 'timeline shows head:claude');
+    check(second.out.includes('[development:claude]'), 'timeline shows development:claude');
     return { sandbox, stateDir };
   },
 
@@ -285,7 +326,7 @@ const SCENARIOS = {
     check(code === 0, `exit code 0 (got ${code})`);
     const task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
     check(task.outcome === 'completed', `completed via pty transport (got ${task.outcome})`);
-    const transcript = readArtifact(sandbox, 'phase-001/claude-transcript.log');
+    const transcript = readArtifact(sandbox, 'phase-001/development-lead-transcript.log');
     check(transcript.includes('Working on phase 1'), 'streamed transcript captured stub output');
     check(readArtifact(sandbox, 'phase-001/diff.patch').includes('feature.txt'), 'real edit captured');
     return { sandbox, stateDir };
@@ -321,7 +362,7 @@ const SCENARIOS = {
     check(readTask(sandbox).outcome === 'completed', 'completed');
     check(readCodexLog(stateDir).some((e) => e.promptType === 'plan-feedback'), 'codex got a plan-feedback call');
     check(readArtifact(sandbox, 'master-plan.md').includes('Revised Plan'), 'master plan was revised');
-    check(readArtifact(sandbox, 'phase-001/claude-prompt.md').includes('SHORTER'), 'claude got the revised instructions');
+    check(readArtifact(sandbox, 'phase-001/development-lead-prompt.md').includes('SHORTER'), 'claude got the revised instructions');
     check(readArtifact(sandbox, 'user-decisions.md').includes('Make the scope smaller'), 'feedback recorded');
     return { sandbox, stateDir };
   },
@@ -372,7 +413,7 @@ const SCENARIOS = {
     task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
     check(task.state === 'reported' && task.outcome === 'completed', `completed after ask (got ${task.state}/${task.outcome})`);
     check(task.pending === null, 'pending cleared');
-    check(has(sandbox, 'phase-001/claude-report.md'), 'claude implemented after approval');
+    check(has(sandbox, 'phase-001/development-lead-report.md'), 'claude implemented after approval');
     check(existsSync(join(taskDir(sandbox), 'user-messages.ndjson')), 'user message recorded');
     return { sandbox, stateDir };
   },
@@ -467,7 +508,7 @@ const SCENARIOS = {
     const { code } = await runPlain(sandbox, makeEnv('invalid_directive', stateDir), 'Do something');
     check(code === 1, `exit code 1 (got ${code})`);
     check(readTask(sandbox).outcome === 'failed', 'failed');
-    check(has(sandbox, 'codex-triage-raw.txt'), 'raw codex output saved');
+    check(has(sandbox, 'head-triage-raw.txt'), 'raw codex output saved');
     return { sandbox, stateDir };
   },
 

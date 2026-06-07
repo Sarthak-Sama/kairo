@@ -3,8 +3,7 @@ import { loadConfig } from '../core/config.js';
 import { Orchestrator } from '../core/orchestrator.js';
 import { TaskStore } from '../core/task-store.js';
 import { ExecaProcessRunner } from '../adapters/process-runner.js';
-import { CodexCliAdapter } from '../adapters/codex.js';
-import { createClaudeAdapter } from '../adapters/claude-factory.js';
+import { createAgentTeam } from '../adapters/team.js';
 import { TimelineRenderer } from '../renderers/timeline.js';
 import { appendText } from '../utils/fs.js';
 import { neverPrompt } from './interactive.js';
@@ -55,14 +54,14 @@ export async function askCommand(repoRoot: string, taskIdPartial: string, messag
   }
 
   const runner = new ExecaProcessRunner();
-  const codex = new CodexCliAdapter(runner, config, repoRoot);
-  const claude = createClaudeAdapter(runner, config, repoRoot);
+  const team = createAgentTeam(runner, config, repoRoot);
   const timeline = new TimelineRenderer();
 
-  if (!(await codex.isAvailable())) {
-    await recordMessage(false, `Codex CLI ("${config.codex.command}") not available`);
+  if (!(await team.head.isAvailable())) {
+    const cmd = config[team.head.provider].command;
+    await recordMessage(false, `head agent "${team.head.provider}" ("${cmd}") not available`);
     console.error(
-      `[kairo] Codex CLI ("${config.codex.command}") not found on PATH. Install it or set codex.command in .kairo/config.json. Message recorded as unhandled.`,
+      `[kairo] head agent "${team.head.provider}" ("${cmd}") not found on PATH. Install it or adjust .kairo/config.json. Message recorded as unhandled.`,
     );
     process.exitCode = 1;
     return;
@@ -71,8 +70,8 @@ export async function askCommand(repoRoot: string, taskIdPartial: string, messag
   const orchestrator = new Orchestrator({
     config,
     repoRoot,
-    codex,
-    claude,
+    head: team.head,
+    developmentLead: team.developmentLead,
     runner,
     // Non-interactive: any follow-up interaction pauses again with fresh
     // pending metadata, answerable by another `kairo ask`.

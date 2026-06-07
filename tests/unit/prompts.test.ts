@@ -42,7 +42,7 @@ describe('triage prompt', () => {
 describe('directive contract centralization (dogfood fix 2)', () => {
   it('the contract explicitly requires actor: "codex"', () => {
     expect(DIRECTIVE_CONTRACT).toContain('"actor" MUST be present');
-    expect(DIRECTIVE_CONTRACT).toContain('"actor": "codex"');
+    expect(DIRECTIVE_CONTRACT).toContain('"actor": "head"');
   });
 
   it('after-user-decision prompt restates the full contract, not "same schema as before"', () => {

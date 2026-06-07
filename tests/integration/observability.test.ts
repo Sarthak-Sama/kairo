@@ -10,8 +10,8 @@ import { writeText } from '../../src/utils/fs.js';
 import {
   makeTempDir,
   cleanupDir,
-  MockCodexAdapter,
-  MockClaudeAdapter,
+  MockHeadAdapter,
+  MockDevLeadAdapter,
   MockProcessRunner,
 } from '../helpers/mocks.js';
 
@@ -30,7 +30,7 @@ describe('followEventLog (bounded)', () => {
     const logPath = join(dir, 'agency-log.ndjson');
     const logger = new EventLogger(logPath);
     await logger.log({ actor: 'kairo', action: 'a', status: 'completed', message: '1' });
-    await logger.log({ actor: 'codex', action: 'b', status: 'started', message: '2' });
+    await logger.log({ actor: 'head', action: 'b', status: 'started', message: '2' });
 
     const seen: string[] = [];
     let done = false;
@@ -42,7 +42,7 @@ describe('followEventLog (bounded)', () => {
 
     // Append while following, then signal completion.
     await new Promise((r) => setTimeout(r, 30));
-    await logger.log({ actor: 'claude', action: 'c', status: 'completed', message: '3' });
+    await logger.log({ actor: 'development_lead', action: 'c', status: 'completed', message: '3' });
     await logger.log({ actor: 'kairo', action: 'd', status: 'completed', message: '4' });
     await new Promise((r) => setTimeout(r, 30));
     done = true;
@@ -73,16 +73,16 @@ describe('observability commands', () => {
 
   /** Create a paused-at-decision task with one completed phase artifact set. */
   async function makePausedTask(): Promise<string> {
-    const codex = new MockCodexAdapter();
-    codex.enqueueDirective(
+    const head = new MockHeadAdapter();
+    head.enqueueDirective(
       { action: 'ask_user', question: 'Ship dark mode too?', reason: 'scope decision' },
       'Plan.',
     );
     const orchestrator = new Orchestrator({
       config: ConfigSchema.parse({ version: 1, checks: [] }),
       repoRoot,
-      codex,
-      claude: new MockClaudeAdapter(),
+      head,
+      developmentLead: new MockDevLeadAdapter(),
       runner: new MockProcessRunner(),
       askUser: async () => null,
       approvePlan: async () => null,

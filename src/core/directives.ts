@@ -9,8 +9,8 @@ import { z } from 'zod';
 export const DIRECTIVE_ACTIONS = [
   'ask_user',
   'self_edit',
-  'delegate_to_claude',
-  'request_claude_revision',
+  'delegate_to_development_lead',
+  'request_development_revision',
   'run_checks',
   'review_diff',
   'continue_next_phase',
@@ -22,9 +22,31 @@ export const DIRECTIVE_ACTIONS = [
 export const DirectiveActionSchema = z.enum(DIRECTIVE_ACTIONS);
 export type DirectiveAction = z.infer<typeof DirectiveActionSchema>;
 
-export const DirectiveSchema = z.object({
-  actor: z.literal('codex'),
-  action: DirectiveActionSchema,
+/**
+ * Backward compatibility: directives written before the role-neutral protocol
+ * (old task.json pending checkpoints, legacy-tuned models) normalize to the
+ * canonical form before validation.
+ */
+const LEGACY_ACTION_MAP: Record<string, DirectiveAction> = {
+  delegate_to_claude: 'delegate_to_development_lead',
+  request_claude_revision: 'request_development_revision',
+};
+
+export function normalizeLegacyDirective(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
+  const obj = { ...(value as Record<string, unknown>) };
+  if (obj.actor === 'codex') obj.actor = 'head';
+  if (typeof obj.action === 'string' && obj.action in LEGACY_ACTION_MAP) {
+    obj.action = LEGACY_ACTION_MAP[obj.action];
+  }
+  return obj;
+}
+
+export const DirectiveSchema = z.preprocess(
+  normalizeLegacyDirective,
+  z.object({
+    actor: z.literal('head'),
+    action: DirectiveActionSchema,
   taskClass: z.string().optional(),
   phase: z.number().int().positive().optional(),
   requiresUserInput: z.boolean().default(false),
@@ -34,7 +56,8 @@ export const DirectiveSchema = z.object({
   question: z.string().optional(),
   successCriteria: z.array(z.string()).default([]),
   checksToRun: z.array(z.string()).default([]),
-});
+  }),
+);
 
 export type Directive = z.infer<typeof DirectiveSchema>;
 

@@ -31,7 +31,7 @@ export function makeApprovePlan(): (planPath: string) => Promise<string | null> 
     try {
       console.log(`\n[kairo] the plan requires your approval before implementation.`);
       console.log(`[kairo] plan: ${planPath}`);
-      console.log(`[kairo] answer "y" to approve, anything else as feedback for codex, or press enter to pause\n`);
+      console.log(`[kairo] answer "y" to approve, anything else as feedback for the head agent, or press enter to pause\n`);
       const answer = await rl.question('approve plan? > ');
       return answer.trim() || null;
     } finally {

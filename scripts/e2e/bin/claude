@@ -28,10 +28,53 @@ const phaseMatch = prompt.match(/## Phase (\d+) instructions/);
 const phase = phaseMatch ? Number(phaseMatch[1]) : 1;
 const isRevision = prompt.includes('This is a REVISION request');
 
+// Head-role support: when Claude is the agency head, triage/review prompts
+// arrive here and must be answered with directives (canonical role-neutral
+// form), never with file edits.
+function headDirective(obj, prose) {
+  const full = {
+    actor: 'head',
+    requiresUserInput: false,
+    risk: 'low',
+    reason: 'stub reason',
+    successCriteria: [],
+    checksToRun: ['test'],
+    ...obj,
+  };
+  return `${prose}\n\n\`\`\`json\n${JSON.stringify(full, null, 2)}\n\`\`\``;
+}
+
+const role = prompt.includes('classify the task')
+  ? 'head-triage'
+  : prompt.includes('reviewing an implementation phase')
+    ? 'head-review'
+    : 'development';
+
 fs.appendFileSync(
   path.join(stateDir, 'claude-log.ndjson'),
-  JSON.stringify({ argv: process.argv.slice(2), phase, isRevision, cwd: process.cwd() }) + '\n',
+  JSON.stringify({ argv: process.argv.slice(2), role, phase, isRevision, cwd: process.cwd() }) + '\n',
 );
+
+if (role === 'head-triage') {
+  console.log(headDirective(
+    {
+      action: 'delegate_to_development_lead',
+      taskClass: 'single_phase_dev_lead',
+      phase: 1,
+      reason: 'feature work suits delegation',
+      instructions: 'Create src/feature.txt containing a greeting line.',
+    },
+    '## Master Plan\nOne phase: create the feature file via the development lead.',
+  ));
+  process.exit(0);
+}
+if (role === 'head-review') {
+  console.log(headDirective(
+    { action: 'declare_complete', reason: 'implementation matches the plan and checks pass' },
+    'Reviewed the diff against the plan. No blockers.',
+  ));
+  process.exit(0);
+}
 
 // Make a real change in the working tree.
 const featurePath = path.join(process.cwd(), 'src', 'feature.txt');

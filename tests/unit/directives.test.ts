@@ -15,8 +15,29 @@ const validDirective = {
 };
 
 describe('directive schema', () => {
-  it('accepts a complete valid directive', () => {
-    expect(DirectiveSchema.parse(validDirective).action).toBe('delegate_to_claude');
+  it('accepts a complete legacy directive and normalizes it to role-neutral form', () => {
+    const parsed = DirectiveSchema.parse(validDirective);
+    expect(parsed.action).toBe('delegate_to_development_lead'); // delegate_to_claude normalized
+    expect(parsed.actor).toBe('head'); // codex normalized
+  });
+
+  it('accepts the canonical role-neutral form directly', () => {
+    const parsed = DirectiveSchema.parse({
+      ...validDirective,
+      actor: 'head',
+      action: 'delegate_to_development_lead',
+    });
+    expect(parsed.action).toBe('delegate_to_development_lead');
+    expect(parsed.actor).toBe('head');
+  });
+
+  it('normalizes legacy request_claude_revision', () => {
+    const parsed = DirectiveSchema.parse({
+      ...validDirective,
+      actor: 'head',
+      action: 'request_claude_revision',
+    });
+    expect(parsed.action).toBe('request_development_revision');
   });
 
   it('rejects unknown actions', () => {
@@ -24,7 +45,7 @@ describe('directive schema', () => {
     expect(result.success).toBe(false);
   });
 
-  it('rejects non-codex actor', () => {
+  it('rejects unknown actors (only head/legacy codex accepted)', () => {
     const result = DirectiveSchema.safeParse({ ...validDirective, actor: 'claude' });
     expect(result.success).toBe(false);
   });
@@ -53,7 +74,7 @@ describe('parseDirective', () => {
     const text = `Here is my plan.\n\n\`\`\`json\n${JSON.stringify(validDirective)}\n\`\`\``;
     const result = parseDirective(text);
     expect(result.ok).toBe(true);
-    expect(result.directive?.action).toBe('delegate_to_claude');
+    expect(result.directive?.action).toBe('delegate_to_development_lead');
   });
 
   it('parses a bare JSON object without fences', () => {

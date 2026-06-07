@@ -8,16 +8,16 @@ import { readText, writeText } from '../../src/utils/fs.js';
 import {
   makeTempDir,
   cleanupDir,
-  MockCodexAdapter,
-  MockClaudeAdapter,
+  MockHeadAdapter,
+  MockDevLeadAdapter,
   MockProcessRunner,
 } from '../helpers/mocks.js';
 
 describe('resume / ask (mocked adapters)', () => {
   let repoRoot: string;
   let config: KairoConfig;
-  let codex: MockCodexAdapter;
-  let claude: MockClaudeAdapter;
+  let head: MockHeadAdapter;
+  let developmentLead: MockDevLeadAdapter;
   let runner: MockProcessRunner;
   let userAnswers: (string | null)[];
   let planAnswers: (string | null)[];
@@ -26,8 +26,8 @@ describe('resume / ask (mocked adapters)', () => {
     return new Orchestrator({
       config,
       repoRoot,
-      codex,
-      claude,
+      head,
+      developmentLead,
       runner,
       askUser: async () => userAnswers.shift() ?? null,
       approvePlan: async () => planAnswers.shift() ?? null,
@@ -36,8 +36,8 @@ describe('resume / ask (mocked adapters)', () => {
 
   /** Fresh adapters/runner, as a separate `kairo resume`/`ask` process would have. */
   function freshProcess(): void {
-    codex = new MockCodexAdapter();
-    claude = new MockClaudeAdapter();
+    head = new MockHeadAdapter();
+    developmentLead = new MockDevLeadAdapter();
     runner = new MockProcessRunner();
     userAnswers = [];
     planAnswers = [];
@@ -49,8 +49,8 @@ describe('resume / ask (mocked adapters)', () => {
 
   /** Run a task that pauses at plan approval; returns the task id. */
   async function pauseAtPlanApproval(): Promise<string> {
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build the modal.' },
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build the modal.' },
       '## Plan\nOne phase.',
     );
     planAnswers = [null]; // non-interactive -> pause
@@ -61,7 +61,7 @@ describe('resume / ask (mocked adapters)', () => {
 
   /** Run a task that pauses at a user decision; returns the task id. */
   async function pauseAtUserDecision(): Promise<string> {
-    codex.enqueueDirective(
+    head.enqueueDirective(
       { action: 'ask_user', question: 'Modal or sidebar?', reason: 'product decision' },
       '## Plan\nPending decision.',
     );
@@ -87,7 +87,7 @@ describe('resume / ask (mocked adapters)', () => {
     const task = await store().getTask(taskId);
     expect(task.pending?.kind).toBe('plan_approval');
     if (task.pending?.kind !== 'plan_approval') throw new Error('unreachable');
-    expect(task.pending.directive.action).toBe('delegate_to_claude');
+    expect(task.pending.directive.action).toBe('delegate_to_development_lead');
     expect(task.pending.directive.instructions).toBe('Build the modal.');
     expect(task.pending.planPath).toContain('master-plan.md');
     expect(task.pending.createdAt).toBeTruthy();
@@ -107,15 +107,15 @@ describe('resume / ask (mocked adapters)', () => {
 
     freshProcess();
     planAnswers = ['y']; // interactive resume prompt answers approve
-    claude.enqueueReport(1);
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+    developmentLead.enqueueReport(1);
+    head.enqueueDirective({ action: 'declare_complete', reason: 'done' });
     runner.on(/status --porcelain/, [{ stdout: '' }, { stdout: ' M src/modal.tsx' }]);
 
     const outcome = await makeOrchestrator().resume(taskId);
 
     expect(outcome.outcome).toBe('completed');
-    expect(claude.invocations).toHaveLength(1);
-    expect(claude.invocations[0]?.prompt).toContain('Build the modal.');
+    expect(developmentLead.invocations).toHaveLength(1);
+    expect(developmentLead.invocations[0]?.prompt).toContain('Build the modal.');
     const task = await store().getTask(taskId);
     expect(task.pending).toBeNull();
     expect(task.state).toBe('reported');
@@ -128,15 +128,15 @@ describe('resume / ask (mocked adapters)', () => {
     freshProcess();
     // `kairo ask` semantics: input handles the pending interaction; any
     // follow-up interaction pauses again (approvePlan stays null).
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build a SMALLER modal.' },
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build a SMALLER modal.' },
       '## Revised Plan\nSmaller scope.',
     );
 
     const outcome = await makeOrchestrator().resume(taskId, 'Make it smaller');
 
     expect(outcome.finalState).toBe('awaiting_plan_approval');
-    expect(codex.invocations.map((i) => i.purpose)).toContain('plan-feedback');
+    expect(head.invocations.map((i) => i.purpose)).toContain('plan-feedback');
     const task = await store().getTask(taskId);
     expect(task.pending?.kind).toBe('plan_approval');
     expect(task.pending?.directive.instructions).toBe('Build a SMALLER modal.'); // revised directive persisted
@@ -146,11 +146,11 @@ describe('resume / ask (mocked adapters)', () => {
 
     // Second ask approves the revised plan and runs to completion.
     freshProcess();
-    claude.enqueueReport(1);
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+    developmentLead.enqueueReport(1);
+    head.enqueueDirective({ action: 'declare_complete', reason: 'done' });
     const second = await makeOrchestrator().resume(taskId, 'y');
     expect(second.outcome).toBe('completed');
-    expect(claude.invocations[0]?.prompt).toContain('Build a SMALLER modal.');
+    expect(developmentLead.invocations[0]?.prompt).toContain('Build a SMALLER modal.');
     expect((await store().getTask(taskId)).pending).toBeNull();
   });
 
@@ -158,19 +158,19 @@ describe('resume / ask (mocked adapters)', () => {
     const taskId = await pauseAtUserDecision();
 
     freshProcess();
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', phase: 1, instructions: 'Build a modal as chosen.' },
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build a modal as chosen.' },
       'Proceeding with modal.',
     );
-    claude.enqueueReport(1);
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+    developmentLead.enqueueReport(1);
+    head.enqueueDirective({ action: 'declare_complete', reason: 'done' });
     planAnswers = ['y']; // the post-decision delegation still passes the gate
 
     const outcome = await makeOrchestrator().resume(taskId, 'Use a modal');
 
     expect(outcome.outcome).toBe('completed');
-    expect(codex.invocations.map((i) => i.purpose)).toContain('after-user-decision');
-    expect(claude.invocations).toHaveLength(1);
+    expect(head.invocations.map((i) => i.purpose)).toContain('after-user-decision');
+    expect(developmentLead.invocations).toHaveLength(1);
     const task = await store().getTask(taskId);
     expect(task.pending).toBeNull();
     const decisions = await readText(join(store().taskDir(taskId), 'user-decisions.md'));
@@ -192,7 +192,7 @@ describe('resume / ask (mocked adapters)', () => {
   });
 
   it('refuses to resume terminal tasks', async () => {
-    codex.enqueueDirective({ action: 'stop_blocked', reason: 'nope' });
+    head.enqueueDirective({ action: 'stop_blocked', reason: 'nope' });
     const outcome = await makeOrchestrator().run('Blocked task');
     expect(outcome.finalState).toBe('blocked');
 
@@ -222,7 +222,7 @@ describe('resume / ask (mocked adapters)', () => {
     runner.on(/status --porcelain/, { stdout: ' M src/unrelated-user-work.ts' });
 
     await expect(makeOrchestrator().resume(taskId)).rejects.toThrow(/commit or stash them, then resume again/);
-    expect(codex.invocations).toHaveLength(0); // refused before any model call
+    expect(head.invocations).toHaveLength(0); // refused before any model call
     const task = await store().getTask(taskId);
     expect(task.state).toBe('awaiting_plan_approval'); // unchanged — retry after cleaning
     expect(task.pending?.kind).toBe('plan_approval');
@@ -230,12 +230,12 @@ describe('resume / ask (mocked adapters)', () => {
 
   it('allows resume after prior implementation with a dirty tree, recording a medium risk', async () => {
     // Pause AFTER phase 1: delegate -> implement -> review asks the user.
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build it.' },
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build it.' },
       'Plan.',
     );
-    claude.enqueueReport(1);
-    codex.enqueueDirective(
+    developmentLead.enqueueReport(1);
+    head.enqueueDirective(
       { action: 'ask_user', question: 'Ship as-is or harden first?', reason: 'tradeoff' },
       'Phase 1 done; tradeoff question.',
     );
@@ -249,7 +249,7 @@ describe('resume / ask (mocked adapters)', () => {
 
     freshProcess();
     runner.on(/status --porcelain/, { stdout: ' M src/modal.tsx' }); // Kairo's own phase-1 changes
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'ship as-is' });
+    head.enqueueDirective({ action: 'declare_complete', reason: 'ship as-is' });
 
     const outcome = await makeOrchestrator().resume(taskId, 'Ship as-is');
 

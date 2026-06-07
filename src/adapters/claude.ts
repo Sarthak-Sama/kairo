@@ -7,6 +7,8 @@ export interface ClaudeInvocation {
   purpose: string;
   /** Called with raw output chunks so the orchestrator can stream a transcript to disk. */
   onChunk?: (chunk: string) => void;
+  /** Per-call permission mode (e.g. "plan" for head-role calls); defaults to config. */
+  permissionModeOverride?: string;
 }
 
 export interface ClaudeResult {
@@ -45,7 +47,9 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
   }
 
   async invoke(invocation: ClaudeInvocation): Promise<ClaudeResult> {
-    const permissionMode = mapPermissionMode(this.config.claude.permissionMode);
+    const permissionMode = mapPermissionMode(
+      invocation.permissionModeOverride ?? this.config.claude.permissionMode,
+    );
     const parts = [
       shellQuote(this.config.claude.command),
       '-p', // print mode: non-interactive, prompt from stdin

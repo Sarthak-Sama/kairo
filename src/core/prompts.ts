@@ -11,9 +11,9 @@ export const DIRECTIVE_CONTRACT = `
 You MUST end your reply with exactly one JSON object (a "directive") inside a \`\`\`json code fence.
 The directive schema:
 {
-  "actor": "codex",
+  "actor": "head",
   "action": one of ${JSON.stringify([...DIRECTIVE_ACTIONS])},
-  "taskClass": string (optional, e.g. "quick_self_edit" | "single_phase_claude" | "multi_phase"),
+  "taskClass": string (optional, e.g. "quick_self_edit" | "single_phase_dev_lead" | "multi_phase"),
   "phase": positive integer (optional),
   "requiresUserInput": boolean,
   "risk": "low" | "medium" | "high",
@@ -25,8 +25,8 @@ The directive schema:
 }
 
 Rules:
-- "actor" MUST be present and MUST be exactly "codex" in every directive — it is required, not optional.
-- "instructions" is REQUIRED for "self_edit", "delegate_to_claude", "request_claude_revision", and "continue_next_phase" — it must contain the complete, self-sufficient instructions for that edit/phase/revision. Kairo refuses these actions without instructions.
+- "actor" MUST be present and MUST be exactly "head" in every directive — it is required, not optional.
+- "instructions" is REQUIRED for "self_edit", "delegate_to_development_lead", "request_development_revision", and "continue_next_phase" — it must contain the complete, self-sufficient instructions for that edit/phase/revision. Kairo refuses these actions without instructions.
 - "checksToRun" entries must be NAMES from the configured checks list, exactly as listed — never shell commands. Unknown names cause ALL configured checks to run instead.
 - "ask_user" is ONLY for product/business/tradeoff/dangerous decisions, never for code-quality questions you can decide yourself.
 - "self_edit" only when delegation would clearly waste tokens (tiny scoped change); say so in "reason". Choosing self_edit does NOT mean edit now — Kairo will invoke you again in a separate write-enabled self-edit session. Put the complete edit instructions in "instructions".
@@ -40,6 +40,7 @@ export function buildTriagePrompt(input: {
   config: KairoConfig;
 }): string {
   const checkNames = input.config.checks.map((c) => c.name).join(', ') || '(none configured)';
+  const devLead = input.config.roles.developmentLead;
   return `You are the agency head for a local coding task runtime called Kairo.
 Your role: inspect the repository, classify the task, and produce a plan plus a directive.
 This is a READ-ONLY planning session: you may read files and run non-destructive commands to inspect the repo, but you must not modify anything. If you decide on "self_edit", Kairo will invoke you again in a separate write-enabled session to perform the edits.
@@ -55,9 +56,9 @@ ${checkNames}
 
 ## What to do
 1. Inspect the repo as needed to understand the task's scope.
-2. Classify the task: quick_self_edit (trivial, you do it), single_phase_claude (one implementation phase by Claude Code), or multi_phase.
+2. Classify the task: quick_self_edit (trivial, you do it), single_phase_dev_lead (one implementation phase by the development lead, ${devLead}), or multi_phase.
 3. Write a concise master plan in markdown (before your directive): scope, approach, phases if multi-phase, risks.
-4. Decide the first action: "self_edit" (Kairo will call you again in a write-enabled self-edit session — put the full edit instructions in "instructions"), "delegate_to_claude" (with full implementation instructions for phase 1), "ask_user" (only if a real product/tradeoff decision is needed first), or "stop_blocked"/"stop_unsafe".
+4. Decide the first action: "self_edit" (Kairo will call you again in a write-enabled self-edit session — put the full edit instructions in "instructions"), "delegate_to_development_lead" (with full implementation instructions for phase 1; the development lead is ${devLead}), "ask_user" (only if a real product/tradeoff decision is needed first), or "stop_blocked"/"stop_unsafe".
 
 ${DIRECTIVE_CONTRACT}`;
 }
@@ -139,7 +140,7 @@ Phase ${input.phase} (revision ${input.revisionCount} of max ${input.maxRevision
 ## Master plan
 ${input.masterPlan || '(no master plan recorded)'}
 
-${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Implementer report (Claude Code)
+${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Implementer report (development lead)
 ${input.claudeReport || '(no report)'}
 
 ## Check results
@@ -155,7 +156,7 @@ ${diff}
 
 ## What to do
 Review the diff against the plan and success criteria. Then choose exactly one action:
-- "request_claude_revision" — for code-quality issues, bugs, failed checks, or scope drift. Put concrete revision instructions in "instructions".
+- "request_development_revision" — for code-quality issues, bugs, failed checks, or scope drift. Put concrete revision instructions in "instructions".
 - "ask_user" — ONLY if a product/business/tradeoff decision emerged.
 - "continue_next_phase" — phase is good and more phases remain in the plan.
 - "declare_complete" — the whole task is done and verified.
@@ -164,7 +165,7 @@ Review the diff against the plan and success criteria. Then choose exactly one a
 ${DIRECTIVE_CONTRACT}`;
 }
 
-export function buildClaudePrompt(input: {
+export function buildDevelopmentLeadPrompt(input: {
   taskTitle: string;
   phase: number;
   instructions: string;
@@ -182,7 +183,7 @@ export function buildClaudePrompt(input: {
   const revisionBlock = input.isRevision
     ? `\n## This is a REVISION request\nYour previous report:\n${input.previousReport ?? '(unavailable)'}\n\nAddress the revision instructions below. Do not redo work that was accepted.\n`
     : '';
-  return `You are the implementation lead for one phase of a coding task, working under an external reviewer.
+  return `You are the development lead for one phase of a coding task, working under an external reviewer.
 
 ## Task
 ${input.taskTitle}
@@ -200,7 +201,7 @@ ${criteria}
 ## Hard rules
 - Implement ONLY this phase. No unrelated refactors, no drive-by cleanups.
 - Do NOT commit. Do not run git commit, push, reset, or clean.
-- You may use your own subagents if useful.
+- You may use your own subagents/tools if your environment provides them.
 
 ## Required report
 End your reply with a markdown report in exactly this structure:
@@ -221,6 +222,8 @@ export function buildSelfEditPrompt(input: {
   phase: number;
   instructions: string;
   masterPlan: string;
+  userDecisions?: string;
+  managerNotes?: string;
 }): string {
   return `You are the agency head for Kairo, now in a WRITE-ENABLED self-edit session.
 During planning you decided this change is small enough to make yourself. Make exactly those edits now.
@@ -231,7 +234,7 @@ ${input.taskTitle}
 ## Your plan
 ${input.masterPlan || '(no plan prose recorded)'}
 
-## Edit instructions (from your own triage directive)
+${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Edit instructions (from your own triage directive)
 ${input.instructions}
 
 ## Hard rules

@@ -2,8 +2,7 @@ import { join } from 'node:path';
 import { loadConfig } from '../core/config.js';
 import { Orchestrator } from '../core/orchestrator.js';
 import { ExecaProcessRunner } from '../adapters/process-runner.js';
-import { CodexCliAdapter } from '../adapters/codex.js';
-import { createClaudeAdapter } from '../adapters/claude-factory.js';
+import { createAgentTeam } from '../adapters/team.js';
 import { TimelineRenderer } from '../renderers/timeline.js';
 import { makeApprovePlan, makeAskUser } from './interactive.js';
 
@@ -11,13 +10,12 @@ import { makeApprovePlan, makeAskUser } from './interactive.js';
 export async function resumeCommand(repoRoot: string, taskIdPartial: string): Promise<void> {
   const config = await loadConfig(repoRoot);
   const runner = new ExecaProcessRunner();
-  const codex = new CodexCliAdapter(runner, config, repoRoot);
-  const claude = createClaudeAdapter(runner, config, repoRoot);
+  const team = createAgentTeam(runner, config, repoRoot);
   const timeline = new TimelineRenderer();
 
-  if (!(await codex.isAvailable())) {
+  if (!(await team.head.isAvailable())) {
     console.error(
-      `[kairo] Codex CLI ("${config.codex.command}") not found on PATH. Install it or set codex.command in .kairo/config.json.`,
+      `[kairo] head agent "${team.head.provider}" (${config[team.head.provider].command}) not found on PATH. Install it or adjust .kairo/config.json.`,
     );
     process.exitCode = 1;
     return;
@@ -26,8 +24,8 @@ export async function resumeCommand(repoRoot: string, taskIdPartial: string): Pr
   const orchestrator = new Orchestrator({
     config,
     repoRoot,
-    codex,
-    claude,
+    head: team.head,
+    developmentLead: team.developmentLead,
     runner,
     askUser: makeAskUser(),
     approvePlan: makeApprovePlan(),

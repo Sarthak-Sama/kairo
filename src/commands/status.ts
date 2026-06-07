@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { loadConfig } from '../core/config.js';
 import { TaskStore, type Task } from '../core/task-store.js';
 import { readEventLog, type AgencyEvent } from '../core/events.js';
+import { actorTag } from '../renderers/timeline.js';
 
 /**
  * Compact agency overview: per task — state, phase, what happened last,
@@ -38,7 +39,7 @@ function formatTaskLines(task: Task, lastEvent: AgencyEvent | undefined): string
   const waiting = task.pending !== null ? '  << WAITING ON YOU' : '';
   const phase = task.currentPhase > 0 ? `  phase ${task.currentPhase}` : '';
   const lastLine = lastEvent
-    ? `[${lastEvent.actor}] ${lastEvent.action} (${lastEvent.status}) — ${truncate(lastEvent.message, 90)}`
+    ? `${actorTag(lastEvent)} ${lastEvent.action} (${lastEvent.status}) — ${truncate(lastEvent.message, 90)}`
     : '(no events)';
   return [
     `  ${task.id}`,

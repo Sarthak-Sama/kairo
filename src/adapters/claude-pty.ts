@@ -92,7 +92,8 @@ export class ClaudePtyAdapter implements ClaudeAdapter {
       };
     }
 
-    const permissionMode = this.config.claude.permissionMode === 'auto' ? 'acceptEdits' : this.config.claude.permissionMode;
+    const requestedMode = invocation.permissionModeOverride ?? this.config.claude.permissionMode;
+    const permissionMode = requestedMode === 'auto' ? 'acceptEdits' : requestedMode;
     // Prompt as an argv element — `--print` does not read prompts from a TTY stdin.
     const args = ['-p', invocation.prompt, '--permission-mode', permissionMode, '--model', this.config.claude.model];
 

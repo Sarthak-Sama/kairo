@@ -2,8 +2,7 @@ import { join } from 'node:path';
 import { loadConfig } from '../core/config.js';
 import { Orchestrator } from '../core/orchestrator.js';
 import { ExecaProcessRunner } from '../adapters/process-runner.js';
-import { CodexCliAdapter } from '../adapters/codex.js';
-import { createClaudeAdapter } from '../adapters/claude-factory.js';
+import { createAgentTeam } from '../adapters/team.js';
 import { TimelineRenderer } from '../renderers/timeline.js';
 import { neverPrompt } from './interactive.js';
 
@@ -16,13 +15,14 @@ import { neverPrompt } from './interactive.js';
 export async function stopCommand(repoRoot: string, taskIdPartial: string, reason: string): Promise<void> {
   const config = await loadConfig(repoRoot);
   const runner = new ExecaProcessRunner();
+  const team = createAgentTeam(runner, config, repoRoot);
   const timeline = new TimelineRenderer();
 
   const orchestrator = new Orchestrator({
     config,
     repoRoot,
-    codex: new CodexCliAdapter(runner, config, repoRoot), // never invoked by stop
-    claude: createClaudeAdapter(runner, config, repoRoot), // never invoked by stop
+    head: team.head, // never invoked by stop
+    developmentLead: team.developmentLead, // never invoked by stop
     runner,
     askUser: neverPrompt.askUser,
     approvePlan: neverPrompt.approvePlan,

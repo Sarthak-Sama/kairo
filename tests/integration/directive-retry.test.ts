@@ -8,8 +8,8 @@ import { fileExists, readText, writeText } from '../../src/utils/fs.js';
 import {
   makeTempDir,
   cleanupDir,
-  MockCodexAdapter,
-  MockClaudeAdapter,
+  MockHeadAdapter,
+  MockDevLeadAdapter,
   MockProcessRunner,
 } from '../helpers/mocks.js';
 
@@ -31,8 +31,8 @@ const DOGFOOD_INVALID_RAW = `The user reversed the original product direction: V
 describe('one-shot directive retry (mocked adapters)', () => {
   let repoRoot: string;
   let config: KairoConfig;
-  let codex: MockCodexAdapter;
-  let claude: MockClaudeAdapter;
+  let head: MockHeadAdapter;
+  let developmentLead: MockDevLeadAdapter;
   let runner: MockProcessRunner;
   let planAnswers: (string | null)[];
   let userAnswers: (string | null)[];
@@ -41,8 +41,8 @@ describe('one-shot directive retry (mocked adapters)', () => {
     return new Orchestrator({
       config,
       repoRoot,
-      codex,
-      claude,
+      head,
+      developmentLead,
       runner,
       askUser: async () => userAnswers.shift() ?? null,
       approvePlan: async () => planAnswers.shift() ?? null,
@@ -57,8 +57,8 @@ describe('one-shot directive retry (mocked adapters)', () => {
     repoRoot = await makeTempDir();
     await writeText(join(repoRoot, 'src', 'index.ts'), 'export const x = 1;\n');
     config = ConfigSchema.parse({ version: 1, checks: [] });
-    codex = new MockCodexAdapter();
-    claude = new MockClaudeAdapter();
+    head = new MockHeadAdapter();
+    developmentLead = new MockDevLeadAdapter();
     runner = new MockProcessRunner();
     planAnswers = [];
     userAnswers = [];
@@ -69,79 +69,79 @@ describe('one-shot directive retry (mocked adapters)', () => {
   });
 
   it('invalid triage recovers on retry and the run continues', async () => {
-    codex.enqueueRaw('Plan prose without any JSON at all.');
-    codex.enqueueDirective(
+    head.enqueueRaw('Plan prose without any JSON at all.');
+    head.enqueueDirective(
       { action: 'self_edit', taskClass: 'quick_self_edit', risk: 'low', reason: 'tiny copy fix', instructions: 'Fix the typo.' },
       'Recovered plan.',
     );
-    codex.enqueueRaw('Edited the file.');
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+    head.enqueueRaw('Edited the file.');
+    head.enqueueDirective({ action: 'declare_complete', reason: 'done' });
     runner.on(/status --porcelain/, [{ stdout: '' }, { stdout: ' M README.md' }]);
 
     const outcome = await makeOrchestrator().run('Fix typo');
 
     expect(outcome.outcome).toBe('completed');
     const taskDir = store().taskDir(outcome.taskId);
-    expect(await fileExists(join(taskDir, 'codex-triage-invalid-attempt-1.txt'))).toBe(true);
-    expect(codex.invocations[1]?.purpose).toBe('triage-retry');
-    expect(codex.invocations[1]?.sandbox).toBe('read-only');
-    expect(codex.invocations[1]?.prompt).toContain('failed directive validation');
-    expect(codex.invocations[1]?.prompt).toContain('Plan prose without any JSON');
-    expect(codex.invocations[1]?.prompt).toContain('"actor" MUST be present'); // full contract restated
+    expect(await fileExists(join(taskDir, 'head-triage-invalid-attempt-1.txt'))).toBe(true);
+    expect(head.invocations[1]?.purpose).toBe('triage-retry');
+    expect(head.invocations[1]?.access).toBe('read');
+    expect(head.invocations[1]?.prompt).toContain('failed directive validation');
+    expect(head.invocations[1]?.prompt).toContain('Plan prose without any JSON');
+    expect(head.invocations[1]?.prompt).toContain('"actor" MUST be present'); // full contract restated
     const { events } = await readEventLog(join(taskDir, 'agency-log.ndjson'));
     expect(events.some((e) => e.action === 'directive_retry' && e.status === 'completed')).toBe(true);
   });
 
   it('invalid review recovers on retry', async () => {
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', phase: 1, instructions: 'Build it.' },
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build it.' },
       'Plan.',
     );
-    claude.enqueueReport(1);
-    codex.enqueueRaw('Looks good to me! (forgot the directive)');
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'matches plan' }, 'Reviewed.');
+    developmentLead.enqueueReport(1);
+    head.enqueueRaw('Looks good to me! (forgot the directive)');
+    head.enqueueDirective({ action: 'declare_complete', reason: 'matches plan' }, 'Reviewed.');
     planAnswers = ['y'];
 
     const outcome = await makeOrchestrator().run('Build modal');
 
     expect(outcome.outcome).toBe('completed');
-    expect(codex.invocations.map((i) => i.purpose)).toContain('review-phase-1-retry');
+    expect(head.invocations.map((i) => i.purpose)).toContain('review-phase-1-retry');
   });
 
   it('the dogfood case: invalid after-user-decision directive recovers on retry', async () => {
-    codex.enqueueDirective(
+    head.enqueueDirective(
       { action: 'ask_user', question: 'Plans and pricing?', reason: 'product decision' },
       'Plan pending decision.',
     );
     userAnswers = ['Keep V1 interest-only, no payment.'];
-    codex.enqueueRaw(DOGFOOD_INVALID_RAW); // missing actor — the real failure
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', phase: 1, instructions: 'Add the reassurance copy.' },
+    head.enqueueRaw(DOGFOOD_INVALID_RAW); // missing actor — the real failure
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Add the reassurance copy.' },
       'Re-emitted validly.',
     );
     planAnswers = ['y'];
-    claude.enqueueReport(1);
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+    developmentLead.enqueueReport(1);
+    head.enqueueDirective({ action: 'declare_complete', reason: 'done' });
     runner.on(/status --porcelain/, [{ stdout: '' }, { stdout: ' M src/form.tsx' }]);
 
     const outcome = await makeOrchestrator().run('Add paid enrollment CTA');
 
     expect(outcome.outcome).toBe('completed'); // previously: blocked
-    expect(codex.invocations.map((i) => i.purpose)).toContain('after-user-decision-retry');
-    expect(claude.invocations[0]?.prompt).toContain('Add the reassurance copy.');
+    expect(head.invocations.map((i) => i.purpose)).toContain('after-user-decision-retry');
+    expect(developmentLead.invocations[0]?.prompt).toContain('Add the reassurance copy.');
   });
 
   it('retry failure still fails honestly with both raw artifacts saved', async () => {
-    codex.enqueueRaw('No JSON, attempt one.');
-    codex.enqueueRaw('No JSON, attempt two either.');
+    head.enqueueRaw('No JSON, attempt one.');
+    head.enqueueRaw('No JSON, attempt two either.');
 
     const outcome = await makeOrchestrator().run('Do something');
 
     expect(outcome.outcome).toBe('failed');
     const taskDir = store().taskDir(outcome.taskId);
-    expect(await readText(join(taskDir, 'codex-triage-invalid-attempt-1.txt'))).toContain('attempt one');
-    expect(await readText(join(taskDir, 'codex-triage-invalid-attempt-2.txt'))).toContain('attempt two');
-    expect(await fileExists(join(taskDir, 'codex-triage-raw.txt'))).toBe(true); // existing failure artifact preserved
+    expect(await readText(join(taskDir, 'head-triage-invalid-attempt-1.txt'))).toContain('attempt one');
+    expect(await readText(join(taskDir, 'head-triage-invalid-attempt-2.txt'))).toContain('attempt two');
+    expect(await fileExists(join(taskDir, 'head-triage-raw.txt'))).toBe(true); // existing failure artifact preserved
     const { events } = await readEventLog(join(taskDir, 'agency-log.ndjson'));
     expect(events.some((e) => e.action === 'directive_retry' && e.status === 'failed')).toBe(true);
   });
@@ -153,7 +153,7 @@ describe('one-shot directive retry (mocked adapters)', () => {
     const outcome = await makeOrchestrator().run('Do something');
 
     expect(outcome.outcome).toBe('failed');
-    expect(codex.invocations).toHaveLength(1); // no second call
+    expect(head.invocations).toHaveLength(1); // no second call
     const { events } = await readEventLog(join(store().taskDir(outcome.taskId), 'agency-log.ndjson'));
     expect(events.some((e) => e.action === 'directive_retry')).toBe(false);
     expect(events.some((e) => e.message.includes('not retrying (not a format problem)'))).toBe(true);
@@ -165,13 +165,13 @@ describe('one-shot directive retry (mocked adapters)', () => {
       checks: [],
       limits: { maxTotalModelCalls: 1, maxPhases: 6, maxRevisionLoopsPerPhase: 3, maxRuntimeMinutes: 90 },
     });
-    codex.enqueueRaw('Invalid triage output.');
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'should never be consumed' });
+    head.enqueueRaw('Invalid triage output.');
+    head.enqueueDirective({ action: 'declare_complete', reason: 'should never be consumed' });
 
     const outcome = await makeOrchestrator().run('Do something');
 
     expect(outcome.outcome).toBe('failed');
-    expect(codex.invocations).toHaveLength(1); // retry was skipped, not attempted
+    expect(head.invocations).toHaveLength(1); // retry was skipped, not attempted
     const { events } = await readEventLog(join(store().taskDir(outcome.taskId), 'agency-log.ndjson'));
     expect(events.some((e) => e.action === 'directive_retry' && e.status === 'skipped')).toBe(true);
   });

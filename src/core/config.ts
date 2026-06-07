@@ -7,9 +7,19 @@ export const CheckSchema = z.object({
   command: z.string().min(1),
 });
 
+export const AgentProviderSchema = z.enum(['codex', 'claude']);
+export type AgentProvider = z.infer<typeof AgentProviderSchema>;
+
 export const ConfigSchema = z.object({
   version: z.literal(1),
   artifactDir: z.string().default('.kairo'),
+  /** Which provider fills each agency role. Defaults preserve the original team. */
+  roles: z
+    .object({
+      head: AgentProviderSchema.default('codex'),
+      developmentLead: AgentProviderSchema.default('claude'),
+    })
+    .default({}),
   limits: z
     .object({
       maxPhases: z.number().int().positive().default(6),
@@ -30,6 +40,8 @@ export const ConfigSchema = z.object({
       command: z.string().default('claude'),
       model: z.string().default('sonnet'),
       permissionMode: z.string().default('auto'),
+      /** Permission mode when Claude acts as HEAD (planning/review/decisions). */
+      headPermissionMode: z.string().default('plan'),
       /** "print" = proven `claude -p` subprocess (default); "pty" = opt-in PTY transport. */
       transport: z.enum(['print', 'pty']).default('print'),
     })
@@ -48,6 +60,10 @@ export type CheckConfig = z.infer<typeof CheckSchema>;
 export const DEFAULT_CONFIG: KairoConfig = {
   version: 1,
   artifactDir: '.kairo',
+  roles: {
+    head: 'codex',
+    developmentLead: 'claude',
+  },
   limits: {
     maxPhases: 6,
     maxRevisionLoopsPerPhase: 3,
@@ -63,6 +79,7 @@ export const DEFAULT_CONFIG: KairoConfig = {
     command: 'claude',
     model: 'sonnet',
     permissionMode: 'auto',
+    headPermissionMode: 'plan',
     transport: 'print',
   },
   checks: [

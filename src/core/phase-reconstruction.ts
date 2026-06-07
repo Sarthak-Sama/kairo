@@ -40,17 +40,29 @@ export async function reconstructPhases(taskDir: string): Promise<PhaseRecord[]>
     const phaseDir = join(taskDir, name);
     const phaseNumber = Number(name.slice('phase-'.length));
 
-    const directive = await readJsonSafe<{ risk?: string }>(join(phaseDir, 'codex-directive.json'));
-    const decision = await readJsonSafe<{ risk?: string }>(join(phaseDir, 'codex-decision.json'));
+    // Role-neutral artifact names first, legacy (codex-*/claude-*) fallbacks
+    // so tasks recorded before the role-selectable team still reconstruct.
+    const directive =
+      (await readJsonSafe<{ risk?: string }>(join(phaseDir, 'head-directive.json'))) ??
+      (await readJsonSafe<{ risk?: string }>(join(phaseDir, 'codex-directive.json')));
+    const decision =
+      (await readJsonSafe<{ risk?: string }>(join(phaseDir, 'head-decision.json'))) ??
+      (await readJsonSafe<{ risk?: string }>(join(phaseDir, 'codex-decision.json')));
 
-    // Implementer report: Claude's report, or the Codex self-edit transcript.
-    let claudeReport = await readTextSafe(join(phaseDir, 'claude-report.md'));
+    // Implementer report: development lead's report, or the head self-edit transcript.
+    let claudeReport =
+      (await readTextSafe(join(phaseDir, 'development-lead-report.md'))) ??
+      (await readTextSafe(join(phaseDir, 'claude-report.md')));
     if (claudeReport === null) {
-      const selfEdit = await readTextSafe(join(phaseDir, 'codex-self-edit-transcript.md'));
-      claudeReport = selfEdit !== null ? `(Codex self-edit — no Claude involvement)\n\n${selfEdit}` : null;
+      const selfEdit =
+        (await readTextSafe(join(phaseDir, 'head-self-edit-transcript.md'))) ??
+        (await readTextSafe(join(phaseDir, 'codex-self-edit-transcript.md')));
+      claudeReport = selfEdit !== null ? `(head self-edit — no development-lead involvement)\n\n${selfEdit}` : null;
     }
 
-    const review = await readTextSafe(join(phaseDir, 'codex-review.md'));
+    const review =
+      (await readTextSafe(join(phaseDir, 'head-review.md'))) ??
+      (await readTextSafe(join(phaseDir, 'codex-review.md')));
     const diff = await readTextSafe(join(phaseDir, 'diff.patch'));
     const checkResults = await readJsonSafe<CheckResult[]>(join(phaseDir, 'checks.json'));
 

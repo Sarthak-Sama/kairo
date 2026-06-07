@@ -2,24 +2,22 @@ import { join } from 'node:path';
 import { loadConfig } from '../core/config.js';
 import { Orchestrator } from '../core/orchestrator.js';
 import { ExecaProcessRunner } from '../adapters/process-runner.js';
-import { CodexCliAdapter } from '../adapters/codex.js';
-import { createClaudeAdapter } from '../adapters/claude-factory.js';
+import { createAgentTeam } from '../adapters/team.js';
 import { TimelineRenderer } from '../renderers/timeline.js';
 import { makeApprovePlan, makeAskUser } from './interactive.js';
 
 export async function runCommand(repoRoot: string, taskTitle: string): Promise<void> {
   const config = await loadConfig(repoRoot); // throws with "run kairo init" guidance if missing
   const runner = new ExecaProcessRunner();
-  const codex = new CodexCliAdapter(runner, config, repoRoot);
-  const claude = createClaudeAdapter(runner, config, repoRoot);
+  const team = createAgentTeam(runner, config, repoRoot);
   const timeline = new TimelineRenderer();
 
-  // Codex is required up front — every run starts with Codex triage. Claude
-  // is only required if the run actually delegates implementation, so its
+  // The head agent is required up front — every run starts with head triage.
+  // The development lead is only required if the run delegates; its
   // availability is checked by the orchestrator at delegation time.
-  if (!(await codex.isAvailable())) {
+  if (!(await team.head.isAvailable())) {
     console.error(
-      `[kairo] Codex CLI ("${config.codex.command}") not found on PATH. Install it or set codex.command in .kairo/config.json.`,
+      `[kairo] head agent "${team.head.provider}" (${config[team.head.provider].command}) not found on PATH. Install it or adjust .kairo/config.json.`,
     );
     process.exitCode = 1;
     return;
@@ -31,8 +29,8 @@ export async function runCommand(repoRoot: string, taskTitle: string): Promise<v
   const orchestrator = new Orchestrator({
     config,
     repoRoot,
-    codex,
-    claude,
+    head: team.head,
+    developmentLead: team.developmentLead,
     runner,
     askUser,
     approvePlan,

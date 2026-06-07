@@ -10,16 +10,16 @@ import { readText, writeJson, writeText } from '../../src/utils/fs.js';
 import {
   makeTempDir,
   cleanupDir,
-  MockCodexAdapter,
-  MockClaudeAdapter,
+  MockHeadAdapter,
+  MockDevLeadAdapter,
   MockProcessRunner,
 } from '../helpers/mocks.js';
 
 describe('stop and note (supervision control)', () => {
   let repoRoot: string;
   let config: KairoConfig;
-  let codex: MockCodexAdapter;
-  let claude: MockClaudeAdapter;
+  let head: MockHeadAdapter;
+  let developmentLead: MockDevLeadAdapter;
   let runner: MockProcessRunner;
   let planAnswers: (string | null)[];
   let userAnswers: (string | null)[];
@@ -28,8 +28,8 @@ describe('stop and note (supervision control)', () => {
     return new Orchestrator({
       config,
       repoRoot,
-      codex,
-      claude,
+      head,
+      developmentLead,
       runner,
       askUser: async () => userAnswers.shift() ?? null,
       approvePlan: async () => planAnswers.shift() ?? null,
@@ -37,8 +37,8 @@ describe('stop and note (supervision control)', () => {
   }
 
   function freshAdapters(): void {
-    codex = new MockCodexAdapter();
-    claude = new MockClaudeAdapter();
+    head = new MockHeadAdapter();
+    developmentLead = new MockDevLeadAdapter();
     runner = new MockProcessRunner();
     planAnswers = [];
     userAnswers = [];
@@ -49,8 +49,8 @@ describe('stop and note (supervision control)', () => {
   }
 
   async function pauseAtPlanApproval(): Promise<string> {
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build the modal.' },
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build the modal.' },
       '## Plan\nOne phase.',
     );
     const outcome = await makeOrchestrator().run('Build a modal');
@@ -59,7 +59,7 @@ describe('stop and note (supervision control)', () => {
   }
 
   async function pauseAtUserDecision(): Promise<string> {
-    codex.enqueueDirective(
+    head.enqueueDirective(
       { action: 'ask_user', question: 'Modal or sidebar?', reason: 'product decision' },
       'Plan.',
     );
@@ -105,7 +105,7 @@ describe('stop and note (supervision control)', () => {
     // Terminal: cannot resume.
     freshAdapters();
     await expect(makeOrchestrator().resume(taskId)).rejects.toThrow(/terminal tasks cannot be resumed/);
-    expect(codex.invocations).toHaveLength(0);
+    expect(head.invocations).toHaveLength(0);
   });
 
   it('stops a paused user-decision task: question preserved, report says stopped by user', async () => {
@@ -126,12 +126,12 @@ describe('stop and note (supervision control)', () => {
 
   it('stop with implementation work present: report not safe to commit, phase facts stated', async () => {
     // Pause AFTER a phase via a review ask_user, then stop.
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', phase: 1, instructions: 'Build it.', checksToRun: ['test'] },
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build it.', checksToRun: ['test'] },
       'Plan.',
     );
-    claude.enqueueReport(1);
-    codex.enqueueDirective({ action: 'ask_user', question: 'Ship as-is?', reason: 'tradeoff' }, 'Phase done.');
+    developmentLead.enqueueReport(1);
+    head.enqueueDirective({ action: 'ask_user', question: 'Ship as-is?', reason: 'tradeoff' }, 'Phase done.');
     planAnswers = ['y'];
     userAnswers = [null];
     runner.on(/status --porcelain/, [{ stdout: '' }, { stdout: ' M src/modal.tsx' }]);
@@ -151,7 +151,7 @@ describe('stop and note (supervision control)', () => {
   });
 
   it('refuses to stop terminal tasks honestly', async () => {
-    codex.enqueueDirective({ action: 'stop_blocked', reason: 'nope' });
+    head.enqueueDirective({ action: 'stop_blocked', reason: 'nope' });
     const outcome = await makeOrchestrator().run('Blocked task');
     expect(outcome.finalState).toBe('blocked');
 
@@ -182,22 +182,22 @@ describe('stop and note (supervision control)', () => {
     const outcome = await makeOrchestrator().resume(taskId);
 
     expect(outcome.outcome).toBe('stopped_by_user');
-    expect(codex.invocations).toHaveLength(0); // stopped before any model call
-    expect(claude.invocations).toHaveLength(0);
+    expect(head.invocations).toHaveLength(0); // stopped before any model call
+    expect(developmentLead.invocations).toHaveLength(0);
     const report = await readText(outcome.reportPath!);
     expect(report).toContain('changed my mind mid-flight');
   });
 
   it('cooperative stop arriving DURING implementation: phase preserved, checks/review skipped honestly', async () => {
-    codex.enqueueDirective(
-      { action: 'delegate_to_claude', phase: 1, instructions: 'Build it.', checksToRun: ['test'] },
+    head.enqueueDirective(
+      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build it.', checksToRun: ['test'] },
       'Plan.',
     );
     planAnswers = ['y'];
     runner.on(/status --porcelain/, [{ stdout: '' }, { stdout: ' M src/modal.tsx' }]);
     // Claude's side effect simulates `kairo stop` firing while it works.
     const taskDirHolder: { dir?: string } = {};
-    claude.enqueue(
+    developmentLead.enqueue(
       `Working...\n\n# Phase 1 Report\n## Changed Files\n- src/modal.tsx\n## Commands Run\n- (none)\n## Risks\nnone\n## Phase Complete\nyes — done`,
       {
         sideEffect: async () => {
@@ -215,7 +215,7 @@ describe('stop and note (supervision control)', () => {
 
     expect(outcome.outcome).toBe('stopped_by_user');
     // Review never happened; checks were skipped with a visible event.
-    expect(codex.invocations.map((i) => i.purpose)).toEqual(['triage']);
+    expect(head.invocations.map((i) => i.purpose)).toEqual(['triage']);
     const { events } = await readEventLog(join(taskDirHolder.dir!, 'agency-log.ndjson'));
     expect(events.some((e) => e.action === 'run_checks' && e.status === 'skipped' && e.message.includes('stop requested'))).toBe(true);
     const report = await readText(outcome.reportPath!);
@@ -260,16 +260,16 @@ describe('stop and note (supervision control)', () => {
 
     freshAdapters();
     planAnswers = ['y'];
-    claude.enqueueReport(1);
-    codex.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+    developmentLead.enqueueReport(1);
+    head.enqueueDirective({ action: 'declare_complete', reason: 'done' });
     runner.on(/status --porcelain/, [{ stdout: '' }, { stdout: ' M src/x.ts' }]);
 
     const outcome = await makeOrchestrator().resume(taskId, 'y');
 
     expect(outcome.outcome).toBe('completed');
-    expect(claude.invocations[0]?.prompt).toContain('## Recent Manager Notes');
-    expect(claude.invocations[0]?.prompt).toContain('copy-only');
-    const reviewPrompt = codex.invocations.find((i) => i.purpose === 'review-phase-1')?.prompt ?? '';
+    expect(developmentLead.invocations[0]?.prompt).toContain('## Recent Manager Notes');
+    expect(developmentLead.invocations[0]?.prompt).toContain('copy-only');
+    const reviewPrompt = head.invocations.find((i) => i.purpose === 'review-phase-1')?.prompt ?? '';
     expect(reviewPrompt).toContain('## Recent Manager Notes');
     expect(reviewPrompt).toContain('Do not add new routes or payment semantics.');
   });

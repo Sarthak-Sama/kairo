@@ -1,8 +1,15 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { CodexAdapter, CodexInvocation, CodexResult } from '../../src/adapters/codex.js';
-import type { ClaudeAdapter, ClaudeInvocation, ClaudeResult } from '../../src/adapters/claude.js';
+import type {
+  AgentProvider,
+  DevelopmentLeadAdapter,
+  DevLeadInvocation,
+  HeadAgentAdapter,
+  HeadInvocation,
+  ImplementationResult,
+  ModelResult,
+} from '../../src/adapters/team.js';
 import type { ProcessRunner, RunOptions, RunResult } from '../../src/adapters/process-runner.js';
 import { parseDirective } from '../../src/core/directives.js';
 import { assertCommandSafe } from '../../src/core/safety.js';
@@ -16,14 +23,23 @@ export async function cleanupDir(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
-/** Scripted Codex: returns queued responses in order. */
-export class MockCodexAdapter implements CodexAdapter {
-  invocations: CodexInvocation[] = [];
+/** Scripted head agent: returns queued responses in order. */
+export class MockHeadAdapter implements HeadAgentAdapter {
+  invocations: HeadInvocation[] = [];
+  /** Toggle to simulate a missing head CLI. */
+  available = true;
+  availabilityChecks = 0;
   private queue: string[] = [];
+
+  constructor(readonly provider: AgentProvider = 'codex') {}
+
+  get displayName(): string {
+    return this.provider;
+  }
 
   enqueueDirective(directive: Partial<Directive> & { action: Directive['action'] }, prose = ''): void {
     const full: Directive = {
-      actor: 'codex',
+      actor: 'head',
       requiresUserInput: false,
       risk: 'low',
       reason: 'mock reason',
@@ -39,43 +55,42 @@ export class MockCodexAdapter implements CodexAdapter {
   }
 
   async isAvailable(): Promise<boolean> {
-    return true;
+    this.availabilityChecks++;
+    return this.available;
   }
 
-  async invoke(invocation: CodexInvocation): Promise<CodexResult> {
+  async invoke(invocation: HeadInvocation): Promise<ModelResult> {
     this.invocations.push(invocation);
     const message = this.queue.shift();
     if (message === undefined) {
-      return {
-        ok: false,
-        lastMessage: '',
-        rawStdout: '',
-        rawStderr: '',
-        exitCode: 1,
-        durationMs: 1,
-        error: 'mock queue empty',
-      };
+      return { ok: false, output: '', raw: '', exitCode: 1, durationMs: 1, error: 'mock queue empty' };
     }
-    return { ok: true, lastMessage: message, rawStdout: message, rawStderr: '', exitCode: 0, durationMs: 1 };
+    return { ok: true, output: message, raw: message, exitCode: 0, durationMs: 1 };
   }
 
-  async invokeForDirective(invocation: CodexInvocation) {
+  async invokeForDirective(invocation: HeadInvocation) {
     const result = await this.invoke(invocation);
     const parsed = result.ok
-      ? parseDirective(result.lastMessage)
+      ? parseDirective(result.output)
       : { ok: false, rawOutput: '', error: result.error ?? 'failed' };
     return { result, parsed };
   }
 }
 
-/** Scripted Claude: returns queued transcripts; can run a side-effect (e.g. write a file). */
-export class MockClaudeAdapter implements ClaudeAdapter {
-  invocations: ClaudeInvocation[] = [];
-  /** Toggle to simulate a missing Claude CLI. */
+/** Scripted development lead: returns queued transcripts; can run a side-effect (e.g. write a file). */
+export class MockDevLeadAdapter implements DevelopmentLeadAdapter {
+  invocations: DevLeadInvocation[] = [];
+  /** Toggle to simulate a missing development-lead CLI. */
   available = true;
   /** How many times the orchestrator probed availability. */
   availabilityChecks = 0;
   private queue: Array<{ transcript: string; ok: boolean; sideEffect?: () => Promise<void> }> = [];
+
+  constructor(readonly provider: AgentProvider = 'claude') {}
+
+  get displayName(): string {
+    return this.provider;
+  }
 
   enqueue(transcript: string, opts: { ok?: boolean; sideEffect?: () => Promise<void> } = {}): void {
     this.queue.push({
@@ -97,7 +112,7 @@ export class MockClaudeAdapter implements ClaudeAdapter {
     return this.available;
   }
 
-  async invoke(invocation: ClaudeInvocation): Promise<ClaudeResult> {
+  async invoke(invocation: DevLeadInvocation): Promise<ImplementationResult> {
     this.invocations.push(invocation);
     const next = this.queue.shift();
     if (!next) {

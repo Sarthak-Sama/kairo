@@ -64,7 +64,7 @@ describe('reconstructPhases', () => {
     const p1 = join(taskDir, 'phase-001');
     await writeText(join(p1, 'codex-self-edit-transcript.md'), 'edited README');
     const phases = await reconstructPhases(taskDir);
-    expect(phases[0]?.claudeReport).toContain('Codex self-edit');
+    expect(phases[0]?.claudeReport).toContain('head self-edit');
     expect(phases[0]?.claudeReport).toContain('edited README');
   });
 

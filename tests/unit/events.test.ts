@@ -20,7 +20,7 @@ describe('event logger', () => {
   it('writes one NDJSON line per event', async () => {
     const logger = new EventLogger(logPath);
     await logger.log({ actor: 'kairo', action: 'task_created', status: 'completed', message: 'created' });
-    await logger.log({ actor: 'codex', action: 'inspect_repo', status: 'started', message: 'inspecting' });
+    await logger.log({ actor: 'head', action: 'inspect_repo', status: 'started', message: 'inspecting' });
     const raw = await readText(logPath);
     const lines = raw.trim().split('\n');
     expect(lines).toHaveLength(2);

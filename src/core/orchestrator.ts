@@ -1,8 +1,7 @@
 import { join } from 'node:path';
 import type { KairoConfig } from './config.js';
-import type { CodexAdapter, CodexResult } from '../adapters/codex.js';
+import type { HeadAgentAdapter, DevelopmentLeadAdapter, ModelResult } from '../adapters/team.js';
 import type { DirectiveParseResult } from './directives.js';
-import type { ClaudeAdapter } from '../adapters/claude.js';
 import type { ProcessRunner } from '../adapters/process-runner.js';
 import { TaskStore, isTerminalState, type Task, type PendingState } from './task-store.js';
 import { reconstructPhases, type PhaseRecord } from './phase-reconstruction.js';
@@ -12,7 +11,7 @@ import { captureBaseline, captureDiff } from './diff.js';
 import { runChecks, type ChecksRun } from './checks.js';
 import {
   buildAfterUserDecisionPrompt,
-  buildClaudePrompt,
+  buildDevelopmentLeadPrompt,
   buildDirectiveRetryPrompt,
   buildPlanFeedbackPrompt,
   buildReviewPrompt,
@@ -27,8 +26,8 @@ import { appendText, fileExists, readText, writeJson, writeText } from '../utils
 export interface OrchestratorDeps {
   config: KairoConfig;
   repoRoot: string;
-  codex: CodexAdapter;
-  claude: ClaudeAdapter;
+  head: HeadAgentAdapter;
+  developmentLead: DevelopmentLeadAdapter;
   runner: ProcessRunner;
   /** Ask the user a question and return their answer; null means "no interactive channel". */
   askUser: (question: string) => Promise<string | null>;
@@ -77,7 +76,7 @@ export function requiresPlanApproval(directive: Directive): boolean {
   if (directive.taskClass && /single_phase|multi_phase|claude|feature/i.test(directive.taskClass)) {
     return true;
   }
-  if (['delegate_to_claude', 'request_claude_revision', 'continue_next_phase'].includes(directive.action)) {
+  if (['delegate_to_development_lead', 'request_development_revision', 'continue_next_phase'].includes(directive.action)) {
     return true;
   }
   if (directive.action === 'self_edit') {
@@ -127,6 +126,21 @@ export class Orchestrator {
     this.store = new TaskStore(join(deps.repoRoot, deps.config.artifactDir), this.clock);
   }
 
+  /** Event logger that stamps role events with the configured provider. */
+  private newEvents(taskDir: string): EventLogger {
+    const logger = new EventLogger(join(taskDir, 'agency-log.ndjson'), this.clock, (input) => {
+      const provider =
+        input.actor === 'head'
+          ? this.deps.head.provider
+          : input.actor === 'development_lead'
+            ? this.deps.developmentLead.provider
+            : undefined;
+      return provider ? { ...input, metadata: { provider, ...(input.metadata ?? {}) } } : input;
+    });
+    if (this.deps.onEvent) logger.onEvent(this.deps.onEvent);
+    return logger;
+  }
+
   async run(taskTitle: string): Promise<RunOutcome> {
     this.startedAt = Date.now();
     const taskId = createTaskId(taskTitle, this.clock());
@@ -136,8 +150,7 @@ export class Orchestrator {
       repoRoot: this.deps.repoRoot,
     });
     const taskDir = this.store.taskDir(taskId);
-    const events = new EventLogger(join(taskDir, 'agency-log.ndjson'), this.clock);
-    if (this.deps.onEvent) events.onEvent(this.deps.onEvent);
+    const events = this.newEvents(taskDir);
 
     await events.log({
       actor: 'kairo',
@@ -191,8 +204,7 @@ export class Orchestrator {
     }
 
     this.modelCalls = task.modelCalls;
-    const events = new EventLogger(join(taskDir, 'agency-log.ndjson'), this.clock);
-    if (this.deps.onEvent) events.onEvent(this.deps.onEvent);
+    const events = this.newEvents(taskDir);
 
     // Rebuild prior phase context from artifacts (task.json + phase folders
     // are canonical; the NDJSON log stays audit-only).
@@ -284,10 +296,10 @@ export class Orchestrator {
       await events.log({ actor: 'kairo', action: 'resume', status: 'skipped', message: 'no answer provided — task remains paused' });
       return { taskId, finalState: task.state, outcome: 'still_paused', reportPath: null };
     }
-    await this.recordDecision(taskDir, `**Q (codex, resume):** ${pending.question}`, answer);
+    await this.recordDecision(taskDir, `**Q (head, resume):** ${pending.question}`, answer);
     await this.setPending(taskId, null);
     await events.log({ actor: 'user', action: 'decision', status: 'completed', message: 'user answered (resume)' });
-    const directive = await this.reinvokeCodexAfterUser(taskId, taskDir, events, task, masterPlan, pending.directive, answer, phases);
+    const directive = await this.reinvokeHeadAfterUser(taskId, taskDir, events, task, masterPlan, pending.directive, answer, phases);
     return this.runLoop({ task, taskDir, events, masterPlan, directive, phases, phase, revisionCount: 0, planApproved });
   }
 
@@ -342,7 +354,7 @@ export class Orchestrator {
     });
 
     await this.store.transition(taskId, 'triaging');
-    await events.log({ actor: 'codex', action: 'inspect_repo', status: 'started', message: 'inspecting repo' });
+    await events.log({ actor: 'head', action: 'inspect_repo', status: 'started', message: 'inspecting repo' });
     const scan = await scanRepo(repoRoot, config);
     await writeText(join(taskDir, 'repo-scan.md'), scan.markdown);
 
@@ -350,38 +362,38 @@ export class Orchestrator {
     if (!(await this.checkLimits(taskId, events))) {
       return this.finishBlocked(taskId, taskDir, events, [], 'limits reached before triage');
     }
-    const triage = await this.invokeCodexForDirective(taskId, taskDir, events, {
+    const triage = await this.invokeHeadForDirective(taskId, taskDir, events, {
       purpose: 'triage',
-      sandbox: 'read-only', // planning never gets write access
+      access: 'read', // planning never gets write access
       prompt: buildTriagePrompt({ taskTitle: task.title, repoScanMarkdown: scan.markdown, config }),
     });
-    await writeText(join(taskDir, 'codex-session.json'), JSON.stringify({
+    await writeText(join(taskDir, 'head-session.json'), JSON.stringify({
       invocations: [{ purpose: 'triage', exitCode: triage.result.exitCode, durationMs: triage.result.durationMs }],
     }, null, 2));
 
     if (!triage.parsed.ok || !triage.parsed.directive) {
-      await writeText(join(taskDir, 'codex-triage-raw.txt'), triage.parsed.rawOutput || triage.result.rawStdout);
+      await writeText(join(taskDir, 'head-triage-raw.txt'), triage.parsed.rawOutput || triage.result.raw);
       await events.log({
-        actor: 'codex',
+        actor: 'head',
         action: 'triage',
         status: 'failed',
-        message: `Codex did not return a valid directive: ${triage.parsed.error ?? 'unknown'}. Raw output saved to ${join(taskDir, 'codex-triage-raw.txt')} — inspect the task folder.`,
+        message: `The head agent did not return a valid directive: ${triage.parsed.error ?? 'unknown'}. Raw output saved to ${join(taskDir, 'head-triage-raw.txt')} — inspect the task folder.`,
       });
-      return this.finishFailed(taskId, taskDir, events, [], 'Codex triage produced an invalid directive');
+      return this.finishFailed(taskId, taskDir, events, [], 'head triage produced an invalid directive');
     }
 
     // Master plan = the prose Codex wrote before the directive JSON.
-    const masterPlan = extractProse(triage.result.lastMessage);
-    await writeText(join(taskDir, 'master-plan.md'), masterPlan || '(Codex provided no plan prose)');
+    const masterPlan = extractProse(triage.result.output);
+    await writeText(join(taskDir, 'master-plan.md'), masterPlan || '(the head agent provided no plan prose)');
     const directive = triage.parsed.directive;
     await events.log({
-      actor: 'codex',
+      actor: 'head',
       action: 'classify_task',
       status: 'completed',
       message: `classified task: ${directive.taskClass ?? directive.action}`,
       metadata: { action: directive.action, risk: directive.risk },
     });
-    await events.log({ actor: 'codex', action: 'plan_ready', status: 'completed', message: 'plan ready' });
+    await events.log({ actor: 'head', action: 'plan_ready', status: 'completed', message: 'plan ready' });
 
     return this.runLoop({
       task,
@@ -429,10 +441,10 @@ export class Orchestrator {
         case 'ask_user': {
           const question = directive.question ?? directive.reason;
           await this.store.transition(taskId, 'awaiting_user_decision');
-          await events.log({ actor: 'codex', action: 'ask_user', status: 'started', message: `needs user decision: ${question}` });
+          await events.log({ actor: 'head', action: 'ask_user', status: 'started', message: `needs user decision: ${question}` });
           const answer = await this.deps.askUser(question);
           if (answer === null || answer.trim() === '') {
-            await this.recordDecision(taskDir, `**Q (codex):** ${question}`, '(no answer — run paused; continue with `kairo resume` or `kairo ask`)');
+            await this.recordDecision(taskDir, `**Q (head):** ${question}`, '(no answer — run paused; continue with `kairo resume` or `kairo ask`)');
             await this.setPending(taskId, {
               kind: 'user_decision',
               directive,
@@ -441,16 +453,16 @@ export class Orchestrator {
             });
             return this.finishState(taskId, taskDir, events, phases, 'awaiting_user_decision', 'awaiting user decision — continue with `kairo resume` or `kairo ask`');
           }
-          await this.recordDecision(taskDir, `**Q (codex):** ${question}`, answer);
+          await this.recordDecision(taskDir, `**Q (head):** ${question}`, answer);
           await events.log({ actor: 'user', action: 'decision', status: 'completed', message: 'user answered' });
           // Feed the answer back to Codex for a fresh directive.
-          directive = await this.reinvokeCodexAfterUser(taskId, taskDir, events, task, masterPlan, directive, answer, phases);
+          directive = await this.reinvokeHeadAfterUser(taskId, taskDir, events, task, masterPlan, directive, answer, phases);
           continue;
         }
 
         case 'self_edit':
-        case 'delegate_to_claude':
-        case 'request_claude_revision': {
+        case 'delegate_to_development_lead':
+        case 'request_development_revision': {
           if (!planApproved) {
             const gate = await this.runPlanApprovalGate(taskId, taskDir, events, task, masterPlan, directive, phases);
             if ('outcome' in gate) return gate;
@@ -464,7 +476,7 @@ export class Orchestrator {
             }
             planApproved = true;
           }
-          const isRevision = directive.action === 'request_claude_revision';
+          const isRevision = directive.action === 'request_development_revision';
           if (isRevision) {
             revisionCount++;
             if (revisionCount > this.deps.config.limits.maxRevisionLoopsPerPhase) {
@@ -476,7 +488,7 @@ export class Orchestrator {
           }
 
           const phaseDir = this.store.phaseDir(taskId, phase);
-          await writeJson(join(phaseDir, 'codex-directive.json'), directive);
+          await writeJson(join(phaseDir, 'head-directive.json'), directive);
 
           const implemented = await this.executeImplementation(taskId, taskDir, phaseDir, events, task, masterPlan, directive, phase, isRevision, phases);
           if ('error' in implemented) {
@@ -520,8 +532,8 @@ export class Orchestrator {
           const updated = await this.store.getTask(taskId);
           updated.currentPhase = phase;
           await this.store.saveTask(updated);
-          directive = { ...directive, action: 'delegate_to_claude', phase };
-          await events.log({ actor: 'codex', action: 'next_phase', status: 'started', message: `starting phase ${phase}` });
+          directive = { ...directive, action: 'delegate_to_development_lead', phase };
+          await events.log({ actor: 'head', action: 'next_phase', status: 'started', message: `starting phase ${phase}` });
           continue;
         }
 
@@ -543,7 +555,7 @@ export class Orchestrator {
         }
 
         case 'declare_complete': {
-          await events.log({ actor: 'codex', action: 'declare_complete', status: 'completed', message: 'task complete' });
+          await events.log({ actor: 'head', action: 'declare_complete', status: 'completed', message: 'task complete' });
           await this.store.transition(taskId, 'completed');
           await this.setOutcome(taskId, 'completed');
           const reportPath = await this.writeReport(taskId, taskDir, phases, directive.reason);
@@ -556,7 +568,7 @@ export class Orchestrator {
           return this.finishBlocked(taskId, taskDir, events, phases, directive.reason);
 
         case 'stop_unsafe': {
-          await events.log({ actor: 'codex', action: 'stop_unsafe', status: 'completed', message: `stopped as unsafe: ${directive.reason}` });
+          await events.log({ actor: 'head', action: 'stop_unsafe', status: 'completed', message: `stopped as unsafe: ${directive.reason}` });
           await this.store.transition(taskId, 'blocked');
           await this.setOutcome(taskId, 'unsafe');
           const reportPath = await this.writeReport(taskId, taskDir, phases, `Stopped as unsafe: ${directive.reason}`);
@@ -655,28 +667,28 @@ export class Orchestrator {
     masterPlan: string,
     feedback: string,
   ): Promise<{ revisedDirective: Directive; revisedPlan?: string } | { error: string }> {
-    const revised = await this.invokeCodexForDirective(task.id, taskDir, events, {
+    const revised = await this.invokeHeadForDirective(task.id, taskDir, events, {
       purpose: 'plan-feedback',
-      sandbox: 'read-only', // still planning — no write access
+      access: 'read', // still planning — no write access
       prompt: buildPlanFeedbackPrompt({ taskTitle: task.title, masterPlan, feedback }),
     });
     if (!revised.parsed.ok || !revised.parsed.directive) {
-      await writeText(join(taskDir, 'codex-plan-feedback-raw.txt'), revised.parsed.rawOutput);
+      await writeText(join(taskDir, 'head-plan-feedback-raw.txt'), revised.parsed.rawOutput);
       await events.log({
-        actor: 'codex',
+        actor: 'head',
         action: 'plan_feedback',
         status: 'failed',
-        message: 'Codex returned an invalid directive after plan feedback; raw output saved — inspect the task folder.',
+        message: 'The head agent returned an invalid directive after plan feedback; raw output saved — inspect the task folder.',
       });
-      return { error: 'Codex produced an invalid directive after plan feedback' };
+      return { error: 'the head agent produced an invalid directive after plan feedback' };
     }
     await events.log({
-      actor: 'codex',
+      actor: 'head',
       action: 'plan_revised',
       status: 'completed',
       message: `plan revised after feedback: next action ${revised.parsed.directive.action}`,
     });
-    const revisedPlan = extractProse(revised.result.lastMessage);
+    const revisedPlan = extractProse(revised.result.output);
     return {
       revisedDirective: revised.parsed.directive,
       ...(revisedPlan ? { revisedPlan } : {}),
@@ -704,10 +716,10 @@ export class Orchestrator {
     if (!(await this.checkLimits(taskId, events))) {
       return this.finishBlocked(taskId, taskDir, events, phasesForReport, 'limits reached before review');
     }
-    await events.log({ actor: 'codex', action: 'review', status: 'started', message: 'reviewing implementation' });
-    const review = await this.invokeCodexForDirective(taskId, taskDir, events, {
+    await events.log({ actor: 'head', action: 'review', status: 'started', message: 'reviewing implementation' });
+    const review = await this.invokeHeadForDirective(taskId, taskDir, events, {
       purpose: `review-phase-${phase}`,
-      sandbox: 'read-only', // reviewing never gets write access
+      access: 'read', // reviewing never gets write access
       prompt: buildReviewPrompt({
         taskTitle: task.title,
         phase,
@@ -724,29 +736,29 @@ export class Orchestrator {
     });
 
     if (!review.parsed.ok || !review.parsed.directive) {
-      await writeText(join(phaseDir, 'codex-review-raw.txt'), review.parsed.rawOutput || review.result.rawStdout);
+      await writeText(join(phaseDir, 'codex-review-raw.txt'), review.parsed.rawOutput || review.result.raw);
       await events.log({
-        actor: 'codex',
+        actor: 'head',
         action: 'review',
         status: 'failed',
-        message: `Codex review returned an invalid directive: ${review.parsed.error ?? 'unknown'}. Raw output saved — inspect the task folder.`,
+        message: `The head review returned an invalid directive: ${review.parsed.error ?? 'unknown'}. Raw output saved — inspect the task folder.`,
       });
       return this.finishFailed(taskId, taskDir, events, phasesForReport, 'Codex review produced an invalid directive');
     }
 
-    record.review = extractProse(review.result.lastMessage);
+    record.review = extractProse(review.result.output);
     if (!record.review) {
-      // Dogfood evidence: a JSON-only review left codex-review.md saying
+      // Dogfood evidence: a JSON-only review left head-review.md saying
       // "(no review prose)" while real reasoning sat in the decision's
       // `reason`. Surface it instead of losing it.
       const d = review.parsed.directive;
-      record.review = `(Codex returned no separate review prose.)\n\nDecision: ${d.action}\nRisk: ${d.risk}\nReason: ${d.reason}`;
+      record.review = `(The head agent returned no separate review prose.)\n\nDecision: ${d.action}\nRisk: ${d.risk}\nReason: ${d.reason}`;
     }
     record.reviewRisk = review.parsed.directive.risk;
-    await writeText(join(phaseDir, 'codex-review.md'), record.review);
-    await writeJson(join(phaseDir, 'codex-decision.json'), review.parsed.directive);
+    await writeText(join(phaseDir, 'head-review.md'), record.review);
+    await writeJson(join(phaseDir, 'head-decision.json'), review.parsed.directive);
     await events.log({
-      actor: 'codex',
+      actor: 'head',
       action: 'review',
       status: 'completed',
       message: `review decision: ${review.parsed.directive.action}`,
@@ -792,39 +804,39 @@ export class Orchestrator {
         instructions: directive.instructions,
         masterPlan,
       });
-      await writeText(join(phaseDir, 'codex-self-edit-prompt.md'), selfEditPrompt);
+      await writeText(join(phaseDir, 'head-self-edit-prompt.md'), selfEditPrompt);
       await events.log({
-        actor: 'codex',
+        actor: 'head',
         action: 'self_edit',
         status: 'started',
-        message: `codex self-editing phase ${phase}: ${directive.reason}`,
+        message: `head self-editing phase ${phase}: ${directive.reason}`,
       });
-      const result = await this.deps.codex.invoke({
+      const result = await this.deps.head.invoke({
         purpose: `self-edit-phase-${phase}`,
-        sandbox: this.deps.config.codex.sandbox, // write-enabled, unlike planning calls
+        access: 'write', // the only write-enabled head call
         prompt: selfEditPrompt,
       });
       this.modelCalls++;
       await writeText(
-        join(phaseDir, 'codex-self-edit-transcript.md'),
-        result.lastMessage || result.rawStdout || '(no output)',
+        join(phaseDir, 'head-self-edit-transcript.md'),
+        result.output || result.raw || '(no output)',
       );
       if (!result.ok) {
         await events.log({
-          actor: 'codex',
+          actor: 'head',
           action: 'self_edit',
           status: 'failed',
-          message: `codex self-edit invocation failed: ${result.error ?? 'unknown error'}`,
+          message: `head self-edit invocation failed: ${result.error ?? 'unknown error'}`,
         });
         return { error: `Codex self-edit invocation failed: ${result.error ?? 'unknown error'}` };
       }
       await events.log({
-        actor: 'codex',
+        actor: 'head',
         action: 'self_edit',
         status: 'completed',
-        message: `codex self-edit session finished for phase ${phase}`,
+        message: `head self-edit session finished for phase ${phase}`,
       });
-      claudeReport = `(Codex self-edit — no Claude involvement)\n\n${result.lastMessage}`;
+      claudeReport = `(Codex self-edit — no Claude involvement)\n\n${result.output}`;
     } else {
       if (!directive.instructions) {
         await events.log({
@@ -837,7 +849,7 @@ export class Orchestrator {
       }
       // Claude is only required once work is actually delegated to it; check
       // availability here rather than blocking runs that never need Claude.
-      if (!(await this.deps.claude.isAvailable())) {
+      if (!(await this.deps.developmentLead.isAvailable())) {
         await events.log({
           actor: 'kairo',
           action: 'delegate',
@@ -849,7 +861,7 @@ export class Orchestrator {
         };
       }
       const previous = phases.find((p) => p.phase === phase);
-      const prompt = buildClaudePrompt({
+      const prompt = buildDevelopmentLeadPrompt({
         taskTitle: task.title,
         phase,
         instructions: directive.instructions,
@@ -860,9 +872,9 @@ export class Orchestrator {
         managerNotes: await this.loadManagerNotes(taskDir),
         ...(previous?.claudeReport ? { previousReport: previous.claudeReport } : {}),
       });
-      await writeText(join(phaseDir, 'claude-prompt.md'), prompt);
+      await writeText(join(phaseDir, 'development-lead-prompt.md'), prompt);
       await events.log({
-        actor: 'claude',
+        actor: 'development_lead',
         action: isRevision ? 'revise' : 'implement',
         status: 'started',
         message: isRevision ? `revising phase ${phase}` : `implementing phase ${phase}`,
@@ -873,12 +885,12 @@ export class Orchestrator {
       // Appends are serialized through a promise chain so chunks land in
       // order, and the final write only happens when nothing was streamed —
       // never both, so content is not duplicated.
-      const transcriptPath = join(phaseDir, 'claude-transcript.log');
+      const transcriptPath = join(phaseDir, 'development-lead-transcript.log');
       await writeText(transcriptPath, '');
       let streamedBytes = 0;
       const stream = { writeError: null as Error | null };
       let writeChain: Promise<void> = Promise.resolve();
-      const result = await this.deps.claude.invoke({
+      const result = await this.deps.developmentLead.invoke({
         purpose: `phase-${phase}${isRevision ? '-revision' : ''}`,
         prompt,
         onChunk: (chunk) => {
@@ -909,13 +921,13 @@ export class Orchestrator {
           message: `streaming the Claude transcript failed (${stream.writeError.message}); the complete transcript was written after completion instead`,
         });
       }
-      await writeText(join(taskDir, 'claude-session.json'), JSON.stringify({
+      await writeText(join(taskDir, 'development-lead-session.json'), JSON.stringify({
         lastInvocation: { purpose: `phase-${phase}`, exitCode: result.exitCode, durationMs: result.durationMs },
       }, null, 2));
 
       if (!result.ok) {
         await events.log({
-          actor: 'claude',
+          actor: 'development_lead',
           action: isRevision ? 'revise' : 'implement',
           status: 'failed',
           message: `Claude invocation failed: ${result.error ?? 'unknown error'}`,
@@ -923,9 +935,9 @@ export class Orchestrator {
         return { error: `Claude invocation failed: ${result.error ?? 'unknown error'}` };
       }
       claudeReport = extractClaudeReport(result.transcript);
-      await writeText(join(phaseDir, 'claude-report.md'), claudeReport);
+      await writeText(join(phaseDir, 'development-lead-report.md'), claudeReport);
       await events.log({
-        actor: 'claude',
+        actor: 'development_lead',
         action: isRevision ? 'revise' : 'implement',
         status: 'completed',
         message: `phase ${phase} ${isRevision ? 'revision' : 'implementation'} reported`,
@@ -952,7 +964,7 @@ export class Orchestrator {
         actor: 'kairo',
         action: 'self_edit_verification',
         status: 'failed',
-        message: 'codex self-edit session produced no working-tree changes',
+        message: 'the head self-edit session produced no working-tree changes',
       });
       return { error: 'Codex self-edit session produced no working-tree changes' };
     }
@@ -1036,14 +1048,14 @@ export class Orchestrator {
    * saved as artifacts; every step is logged. Counts model calls and respects
    * limits — if the limit is already reached, the retry is skipped.
    */
-  private async invokeCodexForDirective(
+  private async invokeHeadForDirective(
     taskId: string,
     taskDir: string,
     events: EventLogger,
-    invocation: { purpose: string; sandbox: string; prompt: string },
-  ): Promise<{ result: CodexResult; parsed: DirectiveParseResult }> {
+    invocation: { purpose: string; access: 'read' | 'write'; prompt: string },
+  ): Promise<{ result: ModelResult; parsed: DirectiveParseResult }> {
     this.modelCalls++;
-    const first = await this.deps.codex.invokeForDirective(invocation);
+    const first = await this.deps.head.invokeForDirective(invocation);
     if (first.parsed.ok) return first;
 
     // Retry is for FORMAT failures (Codex answered, JSON invalid). If the
@@ -1051,7 +1063,7 @@ export class Orchestrator {
     // a format-fix retry would just burn another call against the same wall.
     if (!first.result.ok) {
       await events.log({
-        actor: 'codex',
+        actor: 'head',
         action: 'directive_invalid',
         status: 'failed',
         message: `${invocation.purpose}: Codex invocation failed (${first.result.error ?? 'unknown'}) — not retrying (not a format problem)`,
@@ -1059,10 +1071,10 @@ export class Orchestrator {
       return first;
     }
 
-    const firstRawPath = join(taskDir, `codex-${slugifyPurpose(invocation.purpose)}-invalid-attempt-1.txt`);
-    await writeText(firstRawPath, first.parsed.rawOutput || first.result.rawStdout || '(no output)');
+    const firstRawPath = join(taskDir, `head-${slugifyPurpose(invocation.purpose)}-invalid-attempt-1.txt`);
+    await writeText(firstRawPath, first.parsed.rawOutput || first.result.raw || '(no output)');
     await events.log({
-      actor: 'codex',
+      actor: 'head',
       action: 'directive_invalid',
       status: 'failed',
       message: `${invocation.purpose}: invalid directive (${first.parsed.error ?? 'unknown'}) — raw saved to ${firstRawPath}; retrying once`,
@@ -1078,27 +1090,27 @@ export class Orchestrator {
       return first;
     }
 
-    await events.log({ actor: 'codex', action: 'directive_retry', status: 'started', message: `${invocation.purpose}: retrying with validation feedback` });
+    await events.log({ actor: 'head', action: 'directive_retry', status: 'started', message: `${invocation.purpose}: retrying with validation feedback` });
     this.modelCalls++;
-    const retry = await this.deps.codex.invokeForDirective({
+    const retry = await this.deps.head.invokeForDirective({
       purpose: `${invocation.purpose}-retry`,
-      sandbox: 'read-only', // format recovery needs no write access
+      access: 'read', // format recovery needs no write access
       prompt: buildDirectiveRetryPrompt({
         purpose: invocation.purpose,
         validationError: first.parsed.error ?? 'unknown validation error',
-        rawOutput: first.parsed.rawOutput || first.result.rawStdout || '(no output)',
+        rawOutput: first.parsed.rawOutput || first.result.raw || '(no output)',
       }),
     });
     if (retry.parsed.ok) {
-      await events.log({ actor: 'codex', action: 'directive_retry', status: 'completed', message: `${invocation.purpose}: retry produced a valid directive` });
+      await events.log({ actor: 'head', action: 'directive_retry', status: 'completed', message: `${invocation.purpose}: retry produced a valid directive` });
       return retry;
     }
     await writeText(
-      join(taskDir, `codex-${slugifyPurpose(invocation.purpose)}-invalid-attempt-2.txt`),
-      retry.parsed.rawOutput || retry.result.rawStdout || '(no output)',
+      join(taskDir, `head-${slugifyPurpose(invocation.purpose)}-invalid-attempt-2.txt`),
+      retry.parsed.rawOutput || retry.result.raw || '(no output)',
     );
     await events.log({
-      actor: 'codex',
+      actor: 'head',
       action: 'directive_retry',
       status: 'failed',
       message: `${invocation.purpose}: retry also failed validation (${retry.parsed.error ?? 'unknown'})`,
@@ -1155,8 +1167,7 @@ export class Orchestrator {
       throw new Error(`task ${taskId} is already ${task.state} — terminal tasks cannot be stopped`);
     }
 
-    const events = new EventLogger(join(taskDir, 'agency-log.ndjson'), this.clock);
-    if (this.deps.onEvent) events.onEvent(this.deps.onEvent);
+    const events = this.newEvents(taskDir);
     await events.log({ actor: 'user', action: 'stop_requested', status: 'completed', message: `stop requested: ${reason}` });
     await writeJson(join(taskDir, 'stop-requested.json'), {
       reason,
@@ -1226,7 +1237,7 @@ export class Orchestrator {
     return { taskId, finalState: 'blocked', outcome: 'stopped_by_user', reportPath };
   }
 
-  private async reinvokeCodexAfterUser(
+  private async reinvokeHeadAfterUser(
     taskId: string,
     taskDir: string,
     events: EventLogger,
@@ -1247,9 +1258,9 @@ export class Orchestrator {
               return `### Phase ${p.phase}\nChecks: ${checks}\nChanged files: ${p.changedFiles.join(', ') || '(none)'}\nReview: ${p.review || '(pending)'}\nImplementer report:\n${p.claudeReport.slice(0, 2000)}`;
             })
             .join('\n\n');
-    const followup = await this.invokeCodexForDirective(taskId, taskDir, events, {
+    const followup = await this.invokeHeadForDirective(taskId, taskDir, events, {
       purpose: 'after-user-decision',
-      sandbox: 'read-only', // deciding, not editing
+      access: 'read', // deciding, not editing
       prompt: buildAfterUserDecisionPrompt({
         taskTitle: task.title,
         masterPlan,
@@ -1261,19 +1272,19 @@ export class Orchestrator {
       }),
     });
     if (!followup.parsed.ok || !followup.parsed.directive) {
-      await writeText(join(taskDir, 'codex-followup-raw.txt'), followup.parsed.rawOutput);
+      await writeText(join(taskDir, 'head-followup-raw.txt'), followup.parsed.rawOutput);
       await events.log({
-        actor: 'codex',
+        actor: 'head',
         action: 'after_user_decision',
         status: 'failed',
-        message: 'Codex follow-up returned an invalid directive; stopping as blocked',
+        message: 'The head follow-up returned an invalid directive; stopping as blocked',
       });
       return {
-        actor: 'codex',
+        actor: 'head',
         action: 'stop_blocked',
         requiresUserInput: false,
         risk: 'medium',
-        reason: 'Codex could not produce a valid directive after the user decision',
+        reason: 'the head agent could not produce a valid directive after the user decision',
         successCriteria: [],
         checksToRun: [],
       };
@@ -1460,7 +1471,7 @@ function extractProse(message: string): string {
 /**
  * Strip terminal artifacts (ANSI/OSC escape sequences, carriage returns,
  * stray control bytes) from PTY-captured text. Used ONLY for the text that
- * feeds claude-report.md and review prompts — the raw transcript artifact is
+ * feeds development-lead-report.md and review prompts — the raw transcript artifact is
  * preserved exactly as captured.
  */
 export function stripTerminalArtifacts(text: string): string {
