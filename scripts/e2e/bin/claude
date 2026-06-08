@@ -56,6 +56,10 @@ fs.appendFileSync(
 );
 
 if (role === 'head-triage') {
+  // If the operator locked a lane, the prompt says so; otherwise the head
+  // classifies. The lane_copy_classify scenario expects a copy classification.
+  const laneLocked = prompt.includes('operator-selected');
+  const classifiesCopy = process.env.KAIRO_E2E_SCENARIO === 'lane_copy_classify';
   console.log(headDirective(
     {
       action: 'delegate_to_development_lead',
@@ -63,6 +67,8 @@ if (role === 'head-triage') {
       phase: 1,
       reason: 'feature work suits delegation',
       instructions: 'Create src/feature.txt containing a greeting line.',
+      // Echo back nothing when locked (Kairo keeps the operator lane); else classify.
+      ...(laneLocked ? {} : { lane: classifiesCopy ? 'copy' : 'feature' }),
     },
     '## Master Plan\nOne phase: create the feature file via the development lead.',
   ));

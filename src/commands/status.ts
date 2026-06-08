@@ -42,7 +42,7 @@ function formatTaskLines(task: Task, lastEvent: AgencyEvent | undefined): string
     ? `${actorTag(lastEvent)} ${lastEvent.action} (${lastEvent.status}) — ${truncate(lastEvent.message, 90)}`
     : '(no events)';
   const teamLine = task.team
-    ? `profile: ${task.profile ?? 'none'} (head=${task.team.head}, development=${task.team.developmentLead})`
+    ? `lane: ${task.lane ?? 'none'}  profile: ${task.profile ?? 'none'} (head=${task.team.head}, development=${task.team.developmentLead})`
     : null;
   return [
     `  ${task.id}`,

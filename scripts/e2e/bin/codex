@@ -76,7 +76,7 @@ const DELEGATE = {
   reason: 'feature work suits delegation',
   instructions: 'Create src/feature.txt containing a greeting line.',
   successCriteria: ['src/feature.txt exists'],
-  checksToRun: ['test'],
+  lane: 'copy', // stub keeps a light lane so its 2 required checks are satisfiable
 };
 
 function respond() {
@@ -95,9 +95,9 @@ function respond() {
             {
               action: 'self_edit',
               taskClass: 'quick_self_edit',
-              reason: 'one-line change, delegation wasteful',
+              reason: 'one-line copy change, delegation wasteful',
               instructions: 'Append a changelog line to README.md.',
-              checksToRun: ['test'],
+              lane: 'copy',
             },
             '## Plan\nQuick self-edit: append one line to README.md.',
           );

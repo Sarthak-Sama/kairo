@@ -30,11 +30,13 @@ describe('task view model (read-only)', () => {
     expect(views.map((v) => v.title)).toEqual(['newer', 'older']);
   });
 
-  it('includes profile, team, and pending metadata', async () => {
+  it('includes lane, profile, team, and pending metadata', async () => {
     await store.createTask({
       id: '20260607-130000-task',
       title: 'with everything',
       repoRoot: '/r',
+      lane: 'feature',
+      laneSource: 'user-selected',
       profile: 'daily',
       team: { head: 'claude', developmentLead: 'claude' },
     });
@@ -56,7 +58,8 @@ describe('task view model (read-only)', () => {
     };
     await store.saveTask(task);
 
-    const view = await loadTaskView(artifactRoot, 'with-everything'.slice(0, 0) || '20260607-130000-task');
+    const view = await loadTaskView(artifactRoot, '20260607-130000-task');
+    expect(view.lane).toBe('feature');
     expect(view.profile).toBe('daily');
     expect(view.team).toEqual({ head: 'claude', developmentLead: 'claude' });
     expect(view.pending).toEqual({ kind: 'user_decision', question: 'Ship it?' });

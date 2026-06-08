@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { QualityLaneSchema } from './lanes.js';
 
 /**
  * The directive protocol: Codex (the agency head) returns one structured
@@ -56,6 +57,8 @@ export const DirectiveSchema = z.preprocess(
   question: z.string().optional(),
   successCriteria: z.array(z.string()).default([]),
   checksToRun: z.array(z.string()).default([]),
+  /** Quality lane chosen by the head during triage; optional for back-compat. */
+  lane: QualityLaneSchema.optional(),
   }),
 );
 

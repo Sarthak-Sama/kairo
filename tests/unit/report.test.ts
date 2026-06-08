@@ -16,6 +16,8 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     revisionCount: 0,
     modelCalls: 3,
     outcome: 'completed',
+    lane: null,
+    laneSource: null,
     profile: null,
     team: null,
     pending: null,
@@ -202,6 +204,21 @@ describe('report generation', () => {
     });
     expect(report).toContain('- Profile: none');
     expect(report).toContain('- Head planner/reviewer: codex');
+  });
+
+  it('renders the Quality Lane section', () => {
+    const report = generateReport({
+      ...baseInput,
+      qualityLane: { lane: 'feature', source: 'user-selected', requiredChecks: ['typecheck', 'lint', 'test', 'build'] },
+    });
+    expect(report).toContain('## Quality Lane');
+    expect(report).toContain('- Lane: feature');
+    expect(report).toContain('- Source: user-selected');
+    expect(report).toContain('- Required checks: typecheck, lint, test, build');
+  });
+
+  it('omits the Quality Lane section when no lane is set (legacy)', () => {
+    expect(generateReport(baseInput)).not.toContain('## Quality Lane');
   });
 
   it('reflects failed outcome in the Outcome section', () => {

@@ -51,9 +51,17 @@ describe('orchestrator (mocked adapters)', () => {
   beforeEach(async () => {
     repoRoot = await makeTempDir();
     await writeText(join(repoRoot, 'src', 'index.ts'), 'export const x = 1;\n');
+    // All lane-required checks configured so an inferred lane's requirements
+    // are satisfiable (the mock runner passes checks by default). Tests that
+    // exercise subset/failed checks set their own runner rules.
     config = ConfigSchema.parse({
       version: 1,
-      checks: [{ name: 'test', command: 'pnpm test' }],
+      checks: [
+        { name: 'typecheck', command: 'pnpm typecheck' },
+        { name: 'lint', command: 'pnpm lint' },
+        { name: 'test', command: 'pnpm test' },
+        { name: 'build', command: 'pnpm build' },
+      ],
     });
     head = new MockHeadAdapter();
     developmentLead = new MockDevLeadAdapter();
@@ -262,7 +270,6 @@ describe('orchestrator (mocked adapters)', () => {
         phase: 1,
         instructions: 'Build the modal component.',
         successCriteria: ['Modal opens via shortcut'],
-        checksToRun: ['test'],
       },
       '## Master Plan\nOne phase: build modal.',
     );
@@ -309,12 +316,12 @@ describe('orchestrator (mocked adapters)', () => {
 
   it('failed check path: checks fail, codex requests revision, revision passes', async () => {
     head.enqueueDirective(
-      { action: 'delegate_to_development_lead', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build it.', checksToRun: ['test'] },
+      { action: 'delegate_to_development_lead', taskClass: 'single_phase_claude', phase: 1, instructions: 'Build it.' },
       'Plan.',
     );
     developmentLead.enqueueReport(1);
     head.enqueueDirective(
-      { action: 'request_development_revision', phase: 1, instructions: 'Fix the failing test.', checksToRun: ['test'] },
+      { action: 'request_development_revision', phase: 1, instructions: 'Fix the failing test.' },
       'Test failed — revise.',
     );
     developmentLead.enqueueReport(1, { files: ['src/modal.tsx', 'src/modal.test.tsx'] });
@@ -633,12 +640,12 @@ describe('orchestrator (mocked adapters)', () => {
     // check; phase 2 fixed it. The verdict must reflect the LATEST result
     // per check, not aggregate the historical failure forever.
     head.enqueueDirective(
-      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Phase 1: rename in src only.', checksToRun: ['test'] },
+      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Phase 1: rename in src only.' },
       'Two-phase rename plan.',
     );
     developmentLead.enqueueReport(1);
     head.enqueueDirective(
-      { action: 'continue_next_phase', phase: 2, instructions: 'Phase 2: update dependents.', reason: 'expected transitional failure', checksToRun: ['test'] },
+      { action: 'continue_next_phase', phase: 2, instructions: 'Phase 2: update dependents.', reason: 'expected transitional failure' },
       'Failure is transitional — continue.',
     );
     developmentLead.enqueueReport(2);
@@ -677,12 +684,12 @@ describe('orchestrator (mocked adapters)', () => {
     const { events } = await readEventLog(join(store().taskDir(outcome.taskId), 'agency-log.ndjson'));
     expect(events.some((e) => e.message.includes('unknown check(s) npm test'))).toBe(true);
     // The configured check still ran (visible as 1 passed in the summary event).
-    expect(events.some((e) => e.actor === 'checks' && e.message.includes('1 passed'))).toBe(true);
+    expect(events.some((e) => e.actor === 'checks' && e.message.includes('4 passed'))).toBe(true);
   });
 
   it('JSON-only review falls back to the decision reason in head-review.md', async () => {
     head.enqueueDirective(
-      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build it.', checksToRun: ['test'] },
+      { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build it.' },
       'Plan.',
     );
     developmentLead.enqueueReport(1);
@@ -737,7 +744,7 @@ describe('orchestrator (mocked adapters)', () => {
     it('subset run → unrun checks listed and needs manual review', async () => {
       config = multiCheckConfig();
       head.enqueueDirective(
-        { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build.', checksToRun: ['typecheck', 'test'] },
+        { action: 'delegate_to_development_lead', lane: 'copy', phase: 1, instructions: 'Build.', checksToRun: ['typecheck', 'test'] },
         'Plan.',
       );
       developmentLead.enqueueReport(1);
@@ -756,7 +763,7 @@ describe('orchestrator (mocked adapters)', () => {
     it('a later full-suite run_checks restores the safe recommendation', async () => {
       config = multiCheckConfig();
       head.enqueueDirective(
-        { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build.', checksToRun: ['test'] },
+        { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build.' },
         'Plan.',
       );
       developmentLead.enqueueReport(1);
@@ -775,12 +782,122 @@ describe('orchestrator (mocked adapters)', () => {
     });
   });
 
+  describe('quality lanes', () => {
+    function laneOrchestrator(selectedLane: 'copy' | 'bugfix' | 'feature' | 'refactor' | 'risky' | null) {
+      return new Orchestrator({
+        config,
+        repoRoot,
+        head,
+        developmentLead,
+        runner,
+        askUser: async () => userAnswers.shift() ?? null,
+        approvePlan: async () => planAnswers.shift() ?? null,
+        selectedLane,
+      });
+    }
+
+    it('explicit --lane is stored on the task and locked into the triage prompt', async () => {
+      head.enqueueDirective({ action: 'stop_blocked', reason: 'just checking' });
+
+      const outcome = await laneOrchestrator('refactor').run('Restructure something');
+
+      const task = await store().getTask(outcome.taskId);
+      expect(task.lane).toBe('refactor');
+      expect(task.laneSource).toBe('user-selected');
+      expect(head.invocations[0]?.prompt).toContain('Quality Lane: refactor (operator-selected');
+      expect(head.invocations[0]?.prompt).toContain('do NOT change it');
+    });
+
+    it('head-classified lane from the triage directive is stored', async () => {
+      head.enqueueDirective({ action: 'stop_blocked', lane: 'bugfix', reason: 'a bug' });
+
+      const outcome = await laneOrchestrator(null).run('Something broke');
+
+      const task = await store().getTask(outcome.taskId);
+      expect(task.lane).toBe('bugfix');
+      expect(task.laneSource).toBe('head-classified');
+      expect(head.invocations[0]?.prompt).toContain('Quality Lane (you must choose exactly one)');
+    });
+
+    it('falls back to an inferred lane when neither operator nor head named one', async () => {
+      head.enqueueDirective({ action: 'stop_blocked', reason: 'cannot' });
+
+      const outcome = await laneOrchestrator(null).run('Add a brand new payment integration');
+
+      const task = await store().getTask(outcome.taskId);
+      expect(task.lane).toBe('risky'); // payment signal
+      expect(task.laneSource).toBe('inferred');
+    });
+
+    it('feature lane forces approval even for a self-edit the head called quick', async () => {
+      head.enqueueDirective(
+        { action: 'self_edit', taskClass: 'quick_self_edit', risk: 'low', reason: 'small', instructions: 'tiny change' },
+        'Plan.',
+      );
+      planAnswers = [null];
+
+      const outcome = await laneOrchestrator('feature').run('Add a small thing');
+
+      expect(outcome.finalState).toBe('awaiting_plan_approval'); // gate fired despite quick self-edit
+    });
+
+    it('copy lane still lets a genuinely tiny self-edit bypass approval', async () => {
+      head.enqueueDirective(
+        { action: 'self_edit', taskClass: 'quick_self_edit', risk: 'low', reason: 'fix wording', instructions: 'change one string' },
+        'Plan.',
+      );
+      head.enqueueRaw('Changed the wording.');
+      head.enqueueDirective({ action: 'declare_complete', reason: 'done' });
+      statusAfterBaseline(' M README.md');
+
+      const outcome = await laneOrchestrator('copy').run('Fix the wording on the homepage');
+
+      expect(outcome.outcome).toBe('completed');
+      expect(approveCalls).toBe(0); // bypassed
+    });
+
+    it('report includes the Quality Lane section and lane-required-check risk', async () => {
+      config = ConfigSchema.parse({ version: 1, checks: [{ name: 'typecheck', command: 'pnpm typecheck' }, { name: 'test', command: 'pnpm test' }] });
+      head.enqueueDirective({ action: 'delegate_to_development_lead', phase: 1, instructions: 'Build it.' }, 'Plan.');
+      developmentLead.enqueueReport(1);
+      head.enqueueDirective({ action: 'declare_complete', reason: 'done' }, 'Reviewed, no blockers here.');
+      planAnswers = ['y'];
+      statusAfterBaseline(' M src/x.ts');
+
+      const outcome = await laneOrchestrator('feature').run('Add a feature');
+
+      const report = await readText(outcome.reportPath!);
+      expect(report).toContain('## Quality Lane');
+      expect(report).toContain('- Lane: feature');
+      expect(report).toContain('- Source: user-selected');
+      expect(report).toContain('- Required checks: typecheck, lint, test, build');
+      expect(report).toContain('feature lane requires the "lint" check but it is not configured');
+      // Missing-from-config lane checks are medium for feature (high only for risky).
+      expect(report).toContain('**needs manual review**');
+    });
+
+    it('risky lane escalates a missing required check to high (not safe)', async () => {
+      config = ConfigSchema.parse({ version: 1, checks: [{ name: 'typecheck', command: 'pnpm typecheck' }, { name: 'test', command: 'pnpm test' }] });
+      head.enqueueDirective({ action: 'delegate_to_development_lead', phase: 1, instructions: 'Touch auth.' }, 'Plan.');
+      developmentLead.enqueueReport(1);
+      head.enqueueDirective({ action: 'declare_complete', reason: 'done' }, 'Reviewed, no blockers here.');
+      planAnswers = ['y'];
+      statusAfterBaseline(' M src/auth.ts');
+
+      const outcome = await laneOrchestrator('risky').run('Adjust auth config');
+
+      const report = await readText(outcome.reportPath!);
+      expect(report).toContain('risky lane requires the "lint" check but it is not configured');
+      expect(report).toContain('**not safe to commit**');
+    });
+  });
+
   describe('operating profile metadata', () => {
     it('task.json stores profile and team; report carries the Operating Profile section', async () => {
       head = new MockHeadAdapter('claude');
       developmentLead = new MockDevLeadAdapter('claude');
       head.enqueueDirective(
-        { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build.', checksToRun: ['test'] },
+        { action: 'delegate_to_development_lead', phase: 1, instructions: 'Build.' },
         'Plan.',
       );
       developmentLead.enqueueReport(1);

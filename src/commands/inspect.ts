@@ -21,6 +21,7 @@ export async function inspectCommand(repoRoot: string, taskIdPartial: string): P
   console.log(`  updated:     ${task.updatedAt}`);
   console.log(`  phase:       ${task.currentPhase}`);
   console.log(`  model calls: ${task.modelCalls}`);
+  console.log(`  lane:        ${task.lane ?? 'none'}${task.lane ? ` (${task.laneSource ?? 'inferred'})` : ''}`);
   console.log(`  profile:     ${task.profile ?? 'none'}`);
   console.log(
     `  team:        ${task.team ? `head=${task.team.head} development=${task.team.developmentLead}` : '(not recorded — legacy task)'}`,

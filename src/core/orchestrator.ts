@@ -6,6 +6,7 @@ import type { ProcessRunner } from '../adapters/process-runner.js';
 import { TaskStore, isTerminalState, type Task, type PendingState } from './task-store.js';
 import { reconstructPhases, type PhaseRecord } from './phase-reconstruction.js';
 import { FileCancellationSignal, type CancellationSignal } from './cancellation.js';
+import { inferLane, laneDefinition, type QualityLane, type LaneSource } from './lanes.js';
 import { EventLogger, readEventLog } from './events.js';
 import { scanRepo } from './repo-scanner.js';
 import { captureBaseline, captureDiff } from './diff.js';
@@ -40,6 +41,8 @@ export interface OrchestratorDeps {
   approvePlan: (planPath: string) => Promise<string | null>;
   /** User-defined profile name this run was resolved from; null = none. */
   profileName?: string | null;
+  /** Operator-selected quality lane (`--lane`); null means head classifies. */
+  selectedLane?: QualityLane | null;
   onEvent?: (event: import('./events.js').AgencyEvent) => void;
   clock?: () => Date;
 }
@@ -69,11 +72,24 @@ export function isApproval(answer: string): boolean {
 
 /**
  * Decide whether a directive needs explicit user plan approval before any
- * implementation. Only quick, low-risk self-edits skip the gate.
+ * implementation. Lane policy layers on top: feature/refactor/risky always
+ * require approval; bugfix requires it except for tiny low-risk self-edits;
+ * copy keeps the conservative quick-self-edit bypass.
  */
-export function requiresPlanApproval(directive: Directive): boolean {
+export function requiresPlanApproval(directive: Directive, lane?: QualityLane | null): boolean {
   if (['ask_user', 'stop_blocked', 'stop_unsafe', 'declare_complete'].includes(directive.action)) {
     return false;
+  }
+  const isImplementation = ['self_edit', 'delegate_to_development_lead', 'request_development_revision', 'continue_next_phase'].includes(
+    directive.action,
+  );
+  if (lane && isImplementation) {
+    const policy = laneDefinition(lane).approval;
+    if (policy === 'always') return true;
+    // "delegation" (bugfix): approval unless a tiny low-risk quick self-edit.
+    if (policy === 'delegation' && directive.action !== 'self_edit') return true;
+    // copy ("quick-bypass") and bugfix self-edits fall through to the
+    // standard conservative self-edit bypass below.
   }
   if (directive.risk === 'high') return true;
   if (directive.taskClass && /single_phase|multi_phase|claude|feature/i.test(directive.taskClass)) {
@@ -123,6 +139,9 @@ export class Orchestrator {
   private startedAt = 0;
   /** Extra risks accumulated by resume conditions; merged into every report. */
   private resumeRisks: string[] = [];
+  /** Resolved lane for the active run (persisted on the task; read on resume). */
+  private lane: QualityLane | null = null;
+  private laneLocked = false;
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.clock = deps.clock ?? (() => new Date());
@@ -151,12 +170,15 @@ export class Orchestrator {
       id: taskId,
       title: taskTitle,
       repoRoot: this.deps.repoRoot,
+      ...(this.deps.selectedLane ? { lane: this.deps.selectedLane, laneSource: 'user-selected' as const } : {}),
       profile: this.deps.profileName ?? null,
       team: {
         head: this.deps.head.provider,
         developmentLead: this.deps.developmentLead.provider,
       },
     });
+    this.lane = this.deps.selectedLane ?? null;
+    this.laneLocked = this.deps.selectedLane != null;
     const taskDir = this.store.taskDir(taskId);
     const events = this.newEvents(taskDir);
 
@@ -217,6 +239,10 @@ export class Orchestrator {
     // Rebuild prior phase context from artifacts (task.json + phase folders
     // are canonical; the NDJSON log stays audit-only).
     const phases = await reconstructPhases(taskDir);
+
+    // Restore the lane the task started with — resume/ask never re-classify.
+    this.lane = task.lane;
+    this.laneLocked = task.laneSource === 'user-selected';
 
     // A stop requested while the task was pausing wins over the resume.
     const lingeringStop = await this.readStopRequest(taskDir);
@@ -381,6 +407,7 @@ export class Orchestrator {
         repoScanMarkdown: scan.markdown,
         config,
         developmentLeadProvider: this.deps.developmentLead.provider,
+        selectedLane: this.deps.selectedLane ?? null,
       }),
     });
     await writeText(join(taskDir, 'head-session.json'), JSON.stringify({
@@ -405,12 +432,17 @@ export class Orchestrator {
     const masterPlan = extractProse(triage.result.output);
     await writeText(join(taskDir, 'master-plan.md'), masterPlan || '(the head agent provided no plan prose)');
     const directive = triage.parsed.directive;
+
+    // Resolve the quality lane: operator's --lane wins; else the head's
+    // directive lane; else a conservative inference from the directive + task.
+    await this.resolveLane(taskId, directive, task.title);
+
     await events.log({
       actor: 'head',
       action: 'classify_task',
       status: 'completed',
-      message: `classified task: ${directive.taskClass ?? directive.action}`,
-      metadata: { action: directive.action, risk: directive.risk },
+      message: `classified task: ${directive.taskClass ?? directive.action} (lane: ${this.lane})`,
+      metadata: { action: directive.action, risk: directive.risk, lane: this.lane },
     });
     await events.log({ actor: 'head', action: 'plan_ready', status: 'completed', message: 'plan ready' });
 
@@ -619,7 +651,7 @@ export class Orchestrator {
     directive: Directive,
     phases: PhaseRecord[],
   ): Promise<{ revisedDirective?: Directive; revisedPlan?: string } | RunOutcome> {
-    if (!requiresPlanApproval(directive)) {
+    if (!requiresPlanApproval(directive, this.lane)) {
       await events.log({
         actor: 'kairo',
         action: 'plan_approval',
@@ -698,7 +730,7 @@ export class Orchestrator {
     const revised = await this.invokeHeadForDirective(task.id, taskDir, events, {
       purpose: 'plan-feedback',
       access: 'read', // still planning — no write access
-      prompt: buildPlanFeedbackPrompt({ taskTitle: task.title, masterPlan, feedback }),
+      prompt: buildPlanFeedbackPrompt({ taskTitle: task.title, masterPlan, feedback, lane: this.lane, laneLocked: this.laneLocked }),
     });
     if (revised.result.cancelled) {
       return { cancelled: true };
@@ -763,6 +795,7 @@ export class Orchestrator {
         configuredCheckNames: this.deps.config.checks.map((c) => c.name),
         userDecisions: await this.loadUserDecisions(taskDir),
         managerNotes: await this.loadManagerNotes(taskDir),
+        lane: this.lane,
       }),
     });
 
@@ -838,6 +871,9 @@ export class Orchestrator {
         phase,
         instructions: directive.instructions,
         masterPlan,
+        userDecisions: await this.loadUserDecisions(taskDir),
+        managerNotes: await this.loadManagerNotes(taskDir),
+        lane: this.lane,
       });
       await writeText(join(phaseDir, 'head-self-edit-prompt.md'), selfEditPrompt);
       await events.log({
@@ -910,6 +946,7 @@ export class Orchestrator {
         isRevision,
         userDecisions: await this.loadUserDecisions(taskDir),
         managerNotes: await this.loadManagerNotes(taskDir),
+        lane: this.lane,
         ...(previous?.claudeReport ? { previousReport: previous.claudeReport } : {}),
       });
       await writeText(join(phaseDir, 'development-lead-prompt.md'), prompt);
@@ -1212,6 +1249,31 @@ export class Orchestrator {
     return (await fileExists(path)) ? await readText(path) : '(master plan artifact missing)';
   }
 
+  /** Resolve and persist the run's quality lane. Operator > head > inferred. */
+  private async resolveLane(taskId: string, directive: Directive, title: string): Promise<void> {
+    let source: LaneSource;
+    if (this.deps.selectedLane) {
+      this.lane = this.deps.selectedLane;
+      this.laneLocked = true;
+      source = 'user-selected';
+    } else if (directive.lane) {
+      this.lane = directive.lane;
+      source = 'head-classified';
+    } else {
+      this.lane = inferLane({
+        ...(directive.taskClass !== undefined ? { taskClass: directive.taskClass } : {}),
+        risk: directive.risk,
+        action: directive.action,
+        text: `${title} ${directive.reason} ${directive.instructions ?? ''}`,
+      });
+      source = 'inferred';
+    }
+    const task = await this.store.getTask(taskId);
+    task.lane = this.lane;
+    task.laneSource = source;
+    await this.store.saveTask(task);
+  }
+
   /** Binding user decisions for prompt context; empty string when none exist. */
   private async loadUserDecisions(taskDir: string): Promise<string> {
     const path = join(taskDir, 'user-decisions.md');
@@ -1379,6 +1441,8 @@ export class Orchestrator {
         answer,
         userDecisions: await this.loadUserDecisions(taskDir),
         managerNotes: await this.loadManagerNotes(taskDir),
+        lane: this.lane,
+        laneLocked: this.laneLocked,
       }),
     });
     if (followup.result.cancelled) {
@@ -1553,6 +1617,21 @@ export class Orchestrator {
       risks.push('high: Codex review mentions blockers');
     }
 
+    // Lane-required checks: compare lane requirements against what actually
+    // ran (latest result per name). Risk severity is lane-defined.
+    if (task.lane && phases.length > 0) {
+      const def = laneDefinition(task.lane);
+      const configuredNames = new Set(this.deps.config.checks.map((c) => c.name));
+      for (const required of def.requiredChecks) {
+        if (!configuredNames.has(required)) {
+          const sev = task.lane === 'risky' ? 'high' : 'medium';
+          risks.push(`${sev}: ${task.lane} lane requires the "${required}" check but it is not configured`);
+        } else if (!latestByName.has(required) || latestByName.get(required)!.status !== 'passed') {
+          risks.push(`${def.unrunCheckRisk}: ${task.lane} lane requires "${required}" to pass — it did not run or did not pass`);
+        }
+      }
+    }
+
     const diffUnavailable = phases.some((p) => !p.diffAvailable);
     const baselineNote = task.baseline
       ? task.baseline.isGitRepo
@@ -1578,6 +1657,15 @@ export class Orchestrator {
         head: task.team?.head ?? this.deps.head.provider,
         developmentLead: task.team?.developmentLead ?? this.deps.developmentLead.provider,
       },
+      ...(task.lane
+        ? {
+            qualityLane: {
+              lane: task.lane,
+              source: task.laneSource ?? 'inferred',
+              requiredChecks: laneDefinition(task.lane).requiredChecks,
+            },
+          }
+        : {}),
       ...(baselineNote ? { baselineNote } : {}),
       scope: scope.slice(0, 4000),
       summary,

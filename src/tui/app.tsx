@@ -176,7 +176,7 @@ function App({ repoRoot, artifactRoot, initialTaskId }: AppProps) {
                 {selected.outcome ? `  outcome: ${selected.outcome}` : ''}
               </Text>
               <Text>
-                Profile: {selected.profile ?? 'none'}
+                Lane: {selected.lane ?? 'none'}  Profile: {selected.profile ?? 'none'}
                 {selected.team ? `  Team: head=${selected.team.head} development=${selected.team.developmentLead}` : ''}
               </Text>
               {selected.pending && (

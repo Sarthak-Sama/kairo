@@ -28,6 +28,12 @@ export interface ReportInput {
     head: string;
     developmentLead: string;
   };
+  /** Quality lane metadata: lane, how it was decided, and its required checks. */
+  qualityLane?: {
+    lane: string;
+    source: string;
+    requiredChecks: string[];
+  };
   /** One-line description of the git baseline (cleanliness, sha). */
   baselineNote?: string;
   scope: string;
@@ -105,6 +111,14 @@ export function generateReport(input: ReportInput): string {
     lines.push(`- Profile: ${input.operatingProfile.profile ?? 'none'}`);
     lines.push(`- Head planner/reviewer: ${input.operatingProfile.head}`);
     lines.push(`- Development lead: ${input.operatingProfile.developmentLead}`);
+    lines.push('');
+  }
+  if (input.qualityLane) {
+    lines.push('## Quality Lane');
+    lines.push('');
+    lines.push(`- Lane: ${input.qualityLane.lane}`);
+    lines.push(`- Source: ${input.qualityLane.source}`);
+    lines.push(`- Required checks: ${input.qualityLane.requiredChecks.join(', ')}`);
     lines.push('');
   }
   lines.push('## Scope');

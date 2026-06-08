@@ -48,8 +48,9 @@ program
   .command('run')
   .argument('<task>', 'task description')
   .option('--profile <name>', 'user-defined operating profile from .kairo/config.json')
+  .option('--lane <lane>', 'quality lane: copy | bugfix | feature | refactor | risky')
   .description('Run a task through the agency loop')
-  .action((task: string, options: { profile?: string }) =>
+  .action((task: string, options: { profile?: string; lane?: string }) =>
     wrap(() => runCommand(repoRoot, task, options))(),
   );
 

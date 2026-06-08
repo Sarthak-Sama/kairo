@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildAfterUserDecisionPrompt,
+  buildDevelopmentLeadPrompt,
   buildDirectiveRetryPrompt,
   buildPlanFeedbackPrompt,
   buildReviewPrompt,
@@ -18,6 +19,7 @@ describe('triage prompt', () => {
     repoScanMarkdown: '# Repo Scan\n- Files: 3',
     config: DEFAULT_CONFIG,
     developmentLeadProvider: 'claude',
+    selectedLane: null,
   });
 
   it('declares the session read-only and forbids editing during triage', () => {
@@ -117,6 +119,53 @@ describe('user decisions section (decision-amnesia fix)', () => {
     expect(withDecisions).toContain('interest-only');
     const without = buildReviewPrompt(base);
     expect(without).not.toContain('## User Decisions Already Made');
+  });
+});
+
+describe('quality lane in prompts', () => {
+  it('triage prompt lists all lanes and rubrics when none is selected', () => {
+    const prompt = buildTriagePrompt({
+      taskTitle: 'T', repoScanMarkdown: '#', config: DEFAULT_CONFIG,
+      developmentLeadProvider: 'claude', selectedLane: null,
+    });
+    expect(prompt).toContain('Quality Lane (you must choose exactly one)');
+    for (const lane of ['copy', 'bugfix', 'feature', 'refactor', 'risky']) {
+      expect(prompt).toContain(`"${lane}"`);
+    }
+  });
+
+  it('operator-selected lane is marked locked', () => {
+    const prompt = buildTriagePrompt({
+      taskTitle: 'T', repoScanMarkdown: '#', config: DEFAULT_CONFIG,
+      developmentLeadProvider: 'claude', selectedLane: 'risky',
+    });
+    expect(prompt).toContain('Quality Lane: risky (operator-selected');
+    expect(prompt).toContain('do NOT change it');
+    expect(prompt).not.toContain('you must choose exactly one');
+  });
+
+  it('review and development prompts include the lane rubric', () => {
+    const review = buildReviewPrompt({
+      taskTitle: 'T', phase: 1, masterPlan: 'P', claudeReport: 'R', diffPatch: '',
+      checksRun: null, revisionCount: 0, maxRevisions: 3, configuredCheckNames: ['test'], lane: 'bugfix',
+    });
+    expect(review).toContain('Quality Lane: bugfix');
+    expect(review).toContain('not masked');
+
+    const dev = buildDevelopmentLeadPrompt({
+      taskTitle: 'T', phase: 1, instructions: 'do it', successCriteria: [], masterPlan: 'P',
+      isRevision: false, lane: 'refactor',
+    });
+    expect(dev).toContain('Quality Lane: refactor');
+    expect(dev).toContain('preserve behavior');
+  });
+
+  it('self-edit prompt includes the lane rubric', () => {
+    const prompt = buildSelfEditPrompt({
+      taskTitle: 'T', phase: 1, instructions: 'edit', masterPlan: 'P', lane: 'copy',
+    });
+    expect(prompt).toContain('Quality Lane: copy');
+    expect(prompt).toContain('ONLY text/content');
   });
 });
 

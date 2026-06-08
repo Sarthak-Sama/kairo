@@ -13,6 +13,7 @@ export interface TaskView {
   title: string;
   state: Task['state'];
   outcome: string | null;
+  lane: string | null;
   profile: string | null;
   team: { head: string; developmentLead: string } | null;
   pending:
@@ -66,6 +67,7 @@ async function buildView(store: TaskStore, task: Task): Promise<TaskView> {
     title: task.title,
     state: task.state,
     outcome: task.outcome,
+    lane: task.lane,
     profile: task.profile,
     team: task.team,
     pending:

@@ -81,7 +81,14 @@ function initKairo(sandbox, { claudeCommand = 'claude', codexCommand = 'codex', 
   execSync(`node ${JSON.stringify(CLI)} init`, { cwd: sandbox });
   const configPath = join(sandbox, '.kairo', 'config.json');
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  config.checks = [{ name: 'test', command: 'node check-test.js' }];
+  // All lane-required check NAMES configured (same passing command) so an
+  // inferred/declared lane's required checks are satisfiable.
+  config.checks = [
+    { name: 'typecheck', command: 'node check-test.js' },
+    { name: 'lint', command: 'node check-test.js' },
+    { name: 'test', command: 'node check-test.js' },
+    { name: 'build', command: 'node check-test.js' },
+  ];
   config.claude.command = claudeCommand;
   config.claude.transport = claudeTransport;
   config.codex.command = codexCommand;
@@ -270,6 +277,63 @@ const SCENARIOS = {
       `sandbox discipline (got ${sandboxes})`,
     );
     check(!existsSync(join(stateDir, 'claude-log.ndjson')), 'claude never invoked');
+    return { sandbox, stateDir };
+  },
+
+  async lane_feature(check) {
+    // Operator-selected feature lane: approval gate required, lane shown in
+    // the report, lane stored on the task.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox, {
+      codexCommand: 'definitely-missing-codex-xyz',
+      roles: { head: 'claude', developmentLead: 'claude' },
+    });
+    const env = makeEnv('happy_delegation', stateDir);
+
+    const first = await runPlain(sandbox, env, ['run', '--lane', 'feature', 'Add a greeting feature']);
+    check(first.code === 0, `run pauses at gate (got ${first.code})`);
+    let task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.lane === 'feature' && task.laneSource === 'user-selected', `feature lane stored user-selected (got ${task.lane}/${task.laneSource})`);
+    check(task.state === 'awaiting_plan_approval', `feature lane gates (got ${task.state})`);
+    // The triage prompt locked the lane.
+    const headLog = readFileSync(join(stateDir, 'claude-log.ndjson'), 'utf8');
+    check(headLog.includes('head-triage'), 'head triage ran');
+
+    const second = await runPlain(sandbox, env, ['ask', taskId(sandbox), 'y']);
+    check(second.code === 0, `ask exits 0 (got ${second.code})`);
+    task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.outcome === 'completed', `completed (got ${task.outcome})`);
+    const report = readArtifact(sandbox, 'report.md');
+    check(report.includes('## Quality Lane'), 'report has Quality Lane section');
+    check(report.includes('- Lane: feature'), 'report records the lane');
+    check(report.includes('- Source: user-selected'), 'report records the source');
+    return { sandbox, stateDir };
+  },
+
+  async lane_copy_classify(check) {
+    // No --lane: the head classifies the lane (copy here), and it is stored
+    // as head-classified.
+    const sandbox = makeSandbox();
+    const stateDir = mkdtempSync(join(tmpdir(), 'kairo-e2e-state-'));
+    initKairo(sandbox, {
+      codexCommand: 'definitely-missing-codex-xyz',
+      roles: { head: 'claude', developmentLead: 'claude' },
+    });
+    const env = makeEnv('lane_copy_classify', stateDir);
+
+    const first = await runPlain(sandbox, env, 'Improve the greeting copy');
+    check(first.code === 0, `run pauses at gate (got ${first.code})`);
+    let task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.lane === 'copy' && task.laneSource === 'head-classified', `copy lane head-classified (got ${task.lane}/${task.laneSource})`);
+
+    const second = await runPlain(sandbox, env, ['ask', taskId(sandbox), 'y']);
+    check(second.code === 0, `ask exits 0 (got ${second.code})`);
+    task = JSON.parse(readFileSync(join(taskDir(sandbox), 'task.json'), 'utf8'));
+    check(task.outcome === 'completed', `completed (got ${task.outcome})`);
+    const report = readArtifact(sandbox, 'report.md');
+    check(report.includes('- Lane: copy'), 'report records the copy lane');
+    check(report.includes('- Source: head-classified'), 'report records head-classified source');
     return { sandbox, stateDir };
   },
 

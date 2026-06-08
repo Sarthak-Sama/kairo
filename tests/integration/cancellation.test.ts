@@ -78,7 +78,10 @@ describe('Claude print adapter cancellation', () => {
     const result = await adapter.invoke({
       prompt: 'do work',
       purpose: 'test',
-      cancellation: timedSignal(150, 'operator cancelled'),
+      // Generous deadline so the partial echo lands before cancellation even
+      // under parallel test load; the sleep is long enough that completion
+      // can only happen via cancellation.
+      cancellation: timedSignal(600, 'operator cancelled'),
     });
 
     expect(result.cancelled).toBe(true);

@@ -1,6 +1,22 @@
 import { DIRECTIVE_ACTIONS } from './directives.js';
 import type { ChecksRun } from './checks.js';
 import type { KairoConfig } from './config.js';
+import { laneDefinition, laneMenuMarkdown, type QualityLane } from './lanes.js';
+
+/**
+ * Lane rubric block for any prompt. `locked` marks an operator-selected lane
+ * the head must not change (it may still raise risk or ask_user).
+ */
+export function renderLaneSection(lane: QualityLane | null, locked: boolean): string {
+  if (!lane) return '';
+  const def = laneDefinition(lane);
+  return `## Quality Lane: ${lane}${locked ? ' (operator-selected — do NOT change it; you may still raise "risk" or use "ask_user")' : ''}
+
+${def.rubric}
+Lane-required checks: ${def.requiredChecks.join(', ')}.
+
+`;
+}
 
 /**
  * Prompt builders for both agents. Context is reconstructed from artifacts on
@@ -40,9 +56,18 @@ export function buildTriagePrompt(input: {
   config: KairoConfig;
   /** The RESOLVED development-lead provider for this run (profile-aware). */
   developmentLeadProvider: string;
+  /** Operator-selected lane, locked for this run; null means the head must classify. */
+  selectedLane: QualityLane | null;
 }): string {
   const checkNames = input.config.checks.map((c) => c.name).join(', ') || '(none configured)';
   const devLead = input.developmentLeadProvider;
+  const laneBlock = input.selectedLane
+    ? renderLaneSection(input.selectedLane, true) +
+      'The lane above is fixed for this task. Echo it back as "lane" in your directive.\n'
+    : `## Quality Lane (you must choose exactly one)
+Classify this task into exactly ONE quality lane and put it in your directive as "lane". Explain your choice in "reason".
+${laneMenuMarkdown()}
+`;
   return `You are the agency head for a local coding task runtime called Kairo.
 Your role: inspect the repository, classify the task, and produce a plan plus a directive.
 This is a READ-ONLY planning session: you may read files and run non-destructive commands to inspect the repo, but you must not modify anything. If you decide on "self_edit", Kairo will invoke you again in a separate write-enabled session to perform the edits.
@@ -56,8 +81,9 @@ ${input.repoScanMarkdown}
 ## Configured checks
 ${checkNames}
 
+${laneBlock}
 ## What to do
-1. Inspect the repo as needed to understand the task's scope.
+1. Inspect the repo as needed to understand the task's scope. Apply the quality-lane standards above.
 2. Classify the task: quick_self_edit (trivial, you do it), single_phase_dev_lead (one implementation phase by the development lead, ${devLead}), or multi_phase.
 3. Write a concise master plan in markdown (before your directive): scope, approach, phases if multi-phase, risks.
 4. Decide the first action: "self_edit" (Kairo will call you again in a write-enabled self-edit session — put the full edit instructions in "instructions"), "delegate_to_development_lead" (with full implementation instructions for phase 1; the development lead is ${devLead}), "ask_user" (only if a real product/tradeoff decision is needed first), or "stop_blocked"/"stop_unsafe".
@@ -124,7 +150,11 @@ export function buildReviewPrompt(input: {
   configuredCheckNames: string[];
   userDecisions?: string;
   managerNotes?: string;
+  lane?: QualityLane | null;
 }): string {
+  const laneReview = input.lane
+    ? `## Quality Lane: ${input.lane}\nReview focus: ${laneDefinition(input.lane).reviewFocus}\nLane-required checks: ${laneDefinition(input.lane).requiredChecks.join(', ')}.\n\n`
+    : '';
   const checksSummary = input.checksRun
     ? input.checksRun.results
         .map((r) => `- ${r.name}: ${r.status}${r.detail ? ` (${r.detail})` : ''}`)
@@ -142,7 +172,7 @@ Phase ${input.phase} (revision ${input.revisionCount} of max ${input.maxRevision
 ## Master plan
 ${input.masterPlan || '(no master plan recorded)'}
 
-${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Implementer report (development lead)
+${laneReview}${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Implementer report (development lead)
 ${input.claudeReport || '(no report)'}
 
 ## Check results
@@ -177,6 +207,7 @@ export function buildDevelopmentLeadPrompt(input: {
   previousReport?: string;
   userDecisions?: string;
   managerNotes?: string;
+  lane?: QualityLane | null;
 }): string {
   const criteria =
     input.successCriteria.length > 0
@@ -193,7 +224,7 @@ ${input.taskTitle}
 ## Master plan (from the reviewer)
 ${input.masterPlan || '(no plan — single phase task)'}
 
-${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}${revisionBlock}
+${renderLaneSection(input.lane ?? null, false)}${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}${revisionBlock}
 ## Phase ${input.phase} instructions
 ${input.instructions}
 
@@ -226,6 +257,7 @@ export function buildSelfEditPrompt(input: {
   masterPlan: string;
   userDecisions?: string;
   managerNotes?: string;
+  lane?: QualityLane | null;
 }): string {
   return `You are the agency head for Kairo, now in a WRITE-ENABLED self-edit session.
 During planning you decided this change is small enough to make yourself. Make exactly those edits now.
@@ -236,7 +268,7 @@ ${input.taskTitle}
 ## Your plan
 ${input.masterPlan || '(no plan prose recorded)'}
 
-${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Edit instructions (from your own triage directive)
+${renderLaneSection(input.lane ?? null, false)}${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Edit instructions (from your own triage directive)
 ${input.instructions}
 
 ## Hard rules
@@ -255,6 +287,8 @@ export function buildAfterUserDecisionPrompt(input: {
   answer: string;
   userDecisions?: string;
   managerNotes?: string;
+  lane?: QualityLane | null;
+  laneLocked?: boolean;
 }): string {
   return `You previously asked the user a question while working on the task below.
 
@@ -264,7 +298,7 @@ ${input.taskTitle}
 ## Master plan
 ${input.masterPlan}
 
-${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Work completed so far
+${renderLaneSection(input.lane ?? null, input.laneLocked ?? false)}${renderUserDecisionsSection(input.userDecisions ?? '')}${renderManagerNotesSection(input.managerNotes ?? '')}## Work completed so far
 ${input.phaseContext}
 
 ## Your question
@@ -282,6 +316,8 @@ export function buildPlanFeedbackPrompt(input: {
   taskTitle: string;
   masterPlan: string;
   feedback: string;
+  lane?: QualityLane | null;
+  laneLocked?: boolean;
 }): string {
   return `You are the agency head for Kairo. The user reviewed your plan for the task below and sent feedback instead of approving it. Revise your plan/directive accordingly.
 
@@ -291,7 +327,7 @@ ${input.taskTitle}
 ## Your current plan
 ${input.masterPlan}
 
-## User feedback on the plan
+${renderLaneSection(input.lane ?? null, input.laneLocked ?? false)}## User feedback on the plan
 ${input.feedback}
 
 Reply with your revised reasoning and end with one directive JSON object.

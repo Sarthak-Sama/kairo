@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { readdir } from 'node:fs/promises';
 import { ensureDir, fileExists, readJson, writeJson } from '../utils/fs.js';
 import { DirectiveSchema } from './directives.js';
+import { QualityLaneSchema } from './lanes.js';
 
 export const TASK_STATES = [
   'created',
@@ -74,6 +75,10 @@ export const TaskSchema = z.object({
   revisionCount: z.number().int().min(0).default(0),
   modelCalls: z.number().int().min(0).default(0),
   outcome: z.string().nullable().default(null),
+  /** Quality lane resolved for this run; legacy tasks load null. */
+  lane: QualityLaneSchema.nullable().default(null),
+  /** How the lane was decided — user-selected / head-classified / inferred. */
+  laneSource: z.enum(['user-selected', 'head-classified', 'inferred']).nullable().default(null),
   /** User-defined profile name used for this run; null = none (roles/default). */
   profile: z.string().nullable().default(null),
   /** Providers that filled the roles for this run; legacy tasks load null. */
@@ -129,6 +134,8 @@ export class TaskStore {
     id: string;
     title: string;
     repoRoot: string;
+    lane?: import('./lanes.js').QualityLane | null;
+    laneSource?: 'user-selected' | 'head-classified' | 'inferred' | null;
     profile?: string | null;
     team?: { head: 'codex' | 'claude'; developmentLead: 'codex' | 'claude' } | null;
   }): Promise<Task> {
@@ -149,6 +156,8 @@ export class TaskStore {
       revisionCount: 0,
       modelCalls: 0,
       outcome: null,
+      lane: input.lane ?? null,
+      laneSource: input.laneSource ?? null,
       profile: input.profile ?? null,
       team: input.team ?? null,
       pending: null,
